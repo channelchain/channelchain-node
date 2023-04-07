@@ -8,7 +8,10 @@ cd "$SCRIPT_DIR/.."
 echo Building dependencies...
 ./rebar3 compile
 
-erl +MBas aobf +MBlmbcs 512 +A100 +SDio100 +Bi -pa `./rebar3 path` \
+ERL="erl"
+# ERL="$ERL_TOP/bin/cerl -debug"
+
+$ERL +MBas aobf +MBlmbcs 512 +A100 +SDio100 +Bi -pa `./rebar3 path` \
 	-config config/sys.config -args_file config/vm.args.dev \
-	-run ar benchmark_vdf
+	-run ar benchmark_packing ${@:1}
 
