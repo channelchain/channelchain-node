@@ -6,7 +6,7 @@ WORKDIR /app
 COPY . .
 
 # 依存関係（C/C++ NIFコンパイル用）をインストール
-RUN apt-get update && apt-get install -y cmake gcc g++ git make libssl-dev
+RUN apt-get update && apt-get install -y cmake gcc g++ git make libssl-dev netcat-openbsd
 
 # 依存関係のインストールとビルド
 # We will run `rebar3 as prod release` through a builder container bound to the _build directory.
