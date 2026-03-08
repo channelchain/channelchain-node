@@ -1,7 +1,13 @@
+#if defined(__APPLE__)
+#define SYM(x) _##x
+#else
+#define SYM(x) x
+#endif
+
 .text
-.globl	_sha256_block_vdf_order
+.globl	SYM(sha256_block_vdf_order)
 .align	6
-_sha256_block_vdf_order:
+SYM(sha256_block_vdf_order):
 	stp	x29,x30,[sp,#-16]!
 	add	x29,sp,#0
     adr    x3,K2564

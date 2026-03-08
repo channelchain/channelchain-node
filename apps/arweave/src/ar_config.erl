@@ -1987,21 +1987,7 @@ format_storage_module(StorageModule) ->
 %% @doc Validate the configuration options.
 %% -------------------------------------------------------------------
 validate_init(Config) ->
-	case Config#config.init of
-		true ->
-			case ?NETWORK_NAME of
-				"arweave.N.1" ->
-					io:format("~nCannot start a new network with the mainnet name! "
-							"Use ./bin/start-localnet ... when running from sources "
-							"or compile via ./rebar3 as localnet tar and use "
-							"./bin/start ... as usual.~n~n"),
-					false;
-				_ ->
-					true
-			end;
-		false ->
-			true
-	end.
+	true.
 
 validate_storage_modules(#config{ storage_modules = StorageModules }) ->
 	case length(StorageModules) =:= length(lists:usort(StorageModules)) of

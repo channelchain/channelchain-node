@@ -239,16 +239,8 @@ get_v2_price_per_gib_minute_simple(B) ->
 
 %% @doc Return the minimum required transaction fee for the given number of
 %% total bytes stored and gibibyte minute price.
-get_tx_fee(Args) ->
-	{DataSize, GiBMinutePrice, KryderPlusRateMultiplier, Height} = Args,
-	FirstYearPrice = DataSize * GiBMinutePrice * 60 * 24 * 365,
-	{LnDecayDividend, LnDecayDivisor} = ?LN_PRICE_DECAY_ANNUAL,
-	PerpetualPrice = {-FirstYearPrice * LnDecayDivisor * KryderPlusRateMultiplier
-			* (?N_REPLICATIONS(Height)), LnDecayDividend * (?GiB)},
-	MinerShare = ar_fraction:multiply(PerpetualPrice,
-			?MINER_MINIMUM_ENDOWMENT_CONTRIBUTION_SHARE),
-	{Dividend, Divisor} = ar_fraction:add(PerpetualPrice, MinerShare),
-	Dividend div Divisor.
+get_tx_fee(_Args) ->
+	0.
 
 %% @doc Return the block reward, the new endowment pool, and the new debt supply.
 get_miner_reward_endowment_pool_debt_supply(Args) ->
@@ -425,10 +417,8 @@ get_storage_cost(DataSize, Timestamp, Rate, Height) ->
 	StorageCost + HashingCost.
 
 %% @doc Calculate the transaction fee.
-get_tx_fee(DataSize, Timestamp, Rate, Height) ->
-	MaintenanceCost = get_storage_cost(DataSize, Timestamp, Rate, Height),
-	MinerFeeShare = get_miner_fee_share(MaintenanceCost, Height),
-	MaintenanceCost + MinerFeeShare.
+get_tx_fee(_DataSize, _Timestamp, _Rate, _Height) ->
+	0.
 
 %% @doc Return the miner reward and the new endowment pool.
 get_miner_reward_and_endowment_pool({Pool, TXs, unclaimed, _, _, _, _}) ->

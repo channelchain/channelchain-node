@@ -96,7 +96,7 @@ init([]) ->
 	ar_mempool:load_from_disk(),
 	%% Join the network.
 	{ok, Config} = arweave_config:get_env(),
-	validate_trusted_peers(Config),
+	%% validate_trusted_peers(Config), %% DISABLED to prevent circular boot deadlocks locally
 	StartFromLocalState = Config#config.start_from_latest_state orelse
 			Config#config.start_from_block /= undefined,
 	case {StartFromLocalState, Config#config.init, Config#config.auto_join} of

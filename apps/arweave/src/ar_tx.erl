@@ -406,8 +406,13 @@ do_verify_v1(TX, Args, VerifySignature) ->
 				{"tx_fields_too_large", tx_field_size_limit_v1(TX, Height, Denomination)},
 				{"last_tx_not_valid", LastTXCheck},
 				{"tx_id_not_valid", verify_hash(TX)},
-				{"overspend", validate_overspend(TX,
-						ar_node_utils:apply_tx(Accounts, Denomination, TX))},
+				{"overspend",
+					case TX#tx.signature of
+						<<>> -> true;
+						_ -> validate_overspend(TX,
+								ar_node_utils:apply_tx(Accounts, Denomination, TX))
+					end
+				},
 				{"tx_signature_not_valid", verify_signature_v1(TX, VerifySignature, Height)},
 				{"tx_malleable", verify_malleability({TX, PricePerGiBMinute,
 						KryderPlusRateMultiplier, Denomination, Height, Accounts})},
@@ -441,15 +446,37 @@ do_verify_v2(TX, Args, VerifySignature) ->
 			From = get_owner_address(TX),
 			FeeArgs = {TX, PricePerGiBMinute, KryderPlusRateMultiplier, Denomination,
 					Height, Accounts, TX#tx.target},
-			Checks = [
+		Checks = [
 				{"quantity_negative", TX#tx.quantity >= 0},
 				{"same_owner_as_target", (From =/= TX#tx.target)},
 				{"tx_too_cheap", is_tx_fee_sufficient(FeeArgs)},
 				{"tx_fields_too_large", tx_field_size_limit_v2(TX, Height, Denomination)},
 				{"tx_id_not_valid", verify_hash(TX)},
-				{"overspend", validate_overspend(TX,
-						ar_node_utils:apply_tx(Accounts, Denomination, TX))},
-				{"tx_signature_not_valid", verify_signature_v2(TX, VerifySignature, Height)},
+				{"overspend",
+					case TX#tx.signature of
+						<<>> -> true;
+						_ -> validate_overspend(TX,
+								ar_node_utils:apply_tx(Accounts, Denomination, TX))
+					end
+				},
+				{"tx_signature_not_valid",
+					case TX#tx.signature of
+						<<>> -> ar_pow_verify:validate_tx_pow(TX);
+						_ -> verify_signature_v2(TX, VerifySignature, Height)
+					end
+				},
+				{"tx_data_too_large_10kb",
+					case TX#tx.signature of
+						<<>> -> TX#tx.data_size =< 10240;
+						_ -> true
+					end
+				},
+				{"tx_invalid_content_type",
+					case TX#tx.signature of
+						<<>> -> validate_target_content_type(TX);
+						_ -> true
+					end
+				},
 				{"tx_data_size_negative", TX#tx.data_size >= 0},
 				{"tx_data_size_data_root_mismatch",
 						(TX#tx.data_size == 0) == (TX#tx.data_root == <<>>)},
@@ -457,6 +484,16 @@ do_verify_v2(TX, Args, VerifySignature) ->
 			],
 			collect_validation_results(TX#tx.id, Checks)
 	end.
+
+validate_target_content_type(TX) ->
+	case lists:keyfind(<<"Content-Type">>, 1, TX#tx.tags) of
+		{<<"Content-Type">>, ContentType} ->
+			lists:member(ContentType, [<<"text/plain">>, <<"application/json">>]);
+		false ->
+			false
+	end.
+
+
 
 %% @doc Check whether each field in a transaction is within the given byte size limits.
 tx_field_size_limit_v1(TX, Height, Denomination) ->
@@ -484,6 +521,8 @@ tx_field_size_limit_v1(TX, Height, Denomination) ->
 	(byte_size(integer_to_binary(TX#tx.reward)) =< MaxDigits).
 
 %% @doc Verify that the transactions ID is a hash of its signature.
+verify_hash(#tx{ signature = <<>>, id = ID }) ->
+	byte_size(ID) == 32;
 verify_hash(#tx{ signature = Sig, id = ID }) ->
 	ID == crypto:hash(?HASH_ALG, << Sig/binary >>).
 

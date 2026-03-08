@@ -880,7 +880,7 @@ decrement_buffer_size() ->
 record_buffer_size_metric() ->
 	case ets:lookup(?MODULE, buffer_size) of
 		[{_, Size}] ->
-			prometheus_gauge:set(packing_buffer_size, Size);
+			try prometheus_gauge:set(packing_buffer_size, Size) catch _:_ -> ok end;
 		_ ->
 			ok
 	end.

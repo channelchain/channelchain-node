@@ -1,0 +1,34 @@
+{
+  "chain_name": "PermaBoard",
+  "chain_id": "permaboard-mainnet-1",
+  "genesis_timestamp": 1709827200,
+  "token_distribution": {
+    "total_supply": 100000000000000,
+    "endowment_pool": 85000000000000,
+    "admin_pool": 5000000000000,
+    "founder_allocation": 10000000000000
+  },
+  "admin": {
+    "admin_addresses": [
+      "ADMIN_WALLET_ADDRESS_1",
+      "ADMIN_WALLET_ADDRESS_2"
+    ],
+    "delete_cost": 1000,
+    "ban_cost": 10000,
+    "board_close_cost": 100000,
+    "admin_pool_donation_enabled": true
+  },
+  "block_time_target_seconds": 120,
+  "max_tx_data_size": 10240,
+  "allowed_content_types": ["application/json", "text/plain"],
+  "pow_difficulty": 20,
+  "block_reward_from_endowment": 1000000,
+  "inflation_per_block": 100000,
+  "halving_interval": 525600,
+  "min_mining_nodes": 3,
+  "network_peers": [
+    "node1.permaboard.net:1984",
+    "node2.permaboard.net:1984",
+    "node3.permaboard.net:1984"
+  ]
+}

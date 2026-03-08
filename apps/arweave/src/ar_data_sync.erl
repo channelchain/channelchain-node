@@ -3982,7 +3982,11 @@ data_root_index_next({Index, Count}, _Limit) ->
 record_chunk_cache_size_metric() ->
 	case ets:lookup(ar_data_sync_state, chunk_cache_size) of
 		[{_, Size}] ->
-			prometheus_gauge:set(chunk_cache_size, Size);
+			try
+				prometheus_gauge:set(chunk_cache_size, Size)
+			catch
+				_:_ -> ok
+			end;
 		_ ->
 			ok
 	end.

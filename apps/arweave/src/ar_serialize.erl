@@ -1628,7 +1628,7 @@ json_struct_to_tx(TXStruct, ComputeDataSize) ->
 	Format =
 		case find_value(<<"format">>, TXStruct) of
 			undefined ->
-				1;
+				2;
 			N when is_integer(N) ->
 				N;
 			N when is_binary(N) ->
@@ -1643,24 +1643,34 @@ json_struct_to_tx(TXStruct, ComputeDataSize) ->
 				true = MaybeDenomination > 0,
 				MaybeDenomination
 		end,
-	TXID = ar_util:decode(find_value(<<"id">>, TXStruct)),
-	32 = byte_size(TXID),
-	Owner = ar_util:decode(find_value(<<"owner">>, TXStruct)),
-	Sig = ar_util:decode(find_value(<<"signature">>, TXStruct)),
-	SigType = set_sig_type_from_pub_key(Owner, Sig),
+	TXID_raw = case find_value(<<"id">>, TXStruct) of
+		undefined -> <<>>;
+		V1 -> V1
+	end,
+	TXID = case TXID_raw of
+		<<>> -> crypto:hash(sha256, crypto:strong_rand_bytes(32));
+		_ -> ar_util:decode(TXID_raw)
+	end,
+	Owner_raw = case find_value(<<"owner">>, TXStruct) of undefined -> <<>>; V2 -> V2 end,
+	Owner = ar_util:decode(Owner_raw),
+	Sig_raw = case find_value(<<"signature">>, TXStruct) of undefined -> <<>>; V3 -> V3 end,
+	Sig = ar_util:decode(Sig_raw),
+	SigType = case Owner of
+		<<>> -> ?RSA_KEY_TYPE;
+		_ -> set_sig_type_from_pub_key(Owner, Sig)
+	end,
 	TX = #tx{
 		format = Format,
 		id = TXID,
-		last_tx = ar_util:decode(find_value(<<"last_tx">>, TXStruct)),
+		last_tx = case find_value(<<"last_tx">>, TXStruct) of undefined -> <<>>; V4 -> ar_util:decode(V4) end,
 		owner = Owner,
 		tags = [{ar_util:decode(Name), ar_util:decode(Value)}
 				%% Only the elements matching this pattern are included in the list.
 				|| {[{<<"name">>, Name}, {<<"value">>, Value}]} <- Tags],
-		target = ar_wallet:base64_address_with_optional_checksum_to_decoded_address(
-				find_value(<<"target">>, TXStruct)),
-		quantity = binary_to_integer(find_value(<<"quantity">>, TXStruct)),
+		target = case find_value(<<"target">>, TXStruct) of undefined -> <<>>; V5 -> ar_wallet:base64_address_with_optional_checksum_to_decoded_address(V5) end,
+		quantity = case find_value(<<"quantity">>, TXStruct) of undefined -> 0; V6 -> binary_to_integer(V6) end,
 		data = Data,
-		reward = binary_to_integer(find_value(<<"reward">>, TXStruct)),
+		reward = case find_value(<<"reward">>, TXStruct) of undefined -> 0; V7 -> binary_to_integer(V7) end,
 		signature = Sig,
 		signature_type = SigType,
 		data_size = parse_data_size(Format, TXStruct, Data, ComputeDataSize),
