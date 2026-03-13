@@ -12,6 +12,8 @@ execute(Req, Env) ->
 			maybe_add_peer(ar_http_util:arweave_peer(Req), Req),
 			{ok, Req, Env};
 		_ ->
+			%% ChannelChain localtest: accept all clients regardless of x-network header.
+			%% In production, only ?NETWORK_NAME would be accepted.
 			case cowboy_req:method(Req) of
 				<<"GET">> ->
 					{ok, Req, Env};
@@ -20,7 +22,8 @@ execute(Req, Env) ->
 				<<"OPTIONS">> ->
 					{ok, Req, Env};
 				_ ->
-					wrong_network(Req)
+					%% Accept non-matching networks on localtest (client SDK compat)
+					{ok, Req, Env}
 			end
 	end.
 

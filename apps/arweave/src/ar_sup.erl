@@ -101,6 +101,7 @@ init([]) ->
 		?CHILD(ar_pool_job_poller, worker),
 		?CHILD(ar_pool_cm_job_poller, worker),
 		?CHILD(ar_chain_stats, worker),
+		?CHILD(ar_channelchain_index, worker),
 		?CHILD_SUP(ar_node_sup, supervisor)
 	],
 	{ok, Config} = arweave_config:get_env(),

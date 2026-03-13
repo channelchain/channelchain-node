@@ -217,6 +217,16 @@ handle4(Method, SplitPath, Req, Pid) ->
 
 %% Return network information from a given node.
 %% GET request to endpoint /info.
+%% ChannelChain: TX index search endpoint.
+%% GET /channelchain/txs?type=Board&board_id=...&thread_id=...&first=N&sort=desc
+handle(<<"GET">>, [<<"channelchain">>, <<"txs">>], Req, _Pid) ->
+	handle_channelchain_txs(Req);
+
+%% ChannelChain: TX data endpoint.
+%% GET /channelchain/tx/{hash}/data
+handle(<<"GET">>, [<<"channelchain">>, <<"tx">>, Hash, <<"data">>], Req, _Pid) ->
+	handle_channelchain_tx_data(Hash, Req);
+
 handle(<<"GET">>, [], Req, _Pid) ->
 	{200, #{}, ar_serialize:jsonify(ar_info:get_info()), Req};
 
@@ -249,15 +259,19 @@ handle(<<"HEAD">>, [<<"info">>], Req, _Pid) ->
 %% Return permissive CORS headers for all endpoints.
 handle(<<"OPTIONS">>, [<<"block">>], Req, _Pid) ->
 	{200, #{<<"access-control-allow-methods">> => <<"GET, POST">>,
-			<<"access-control-allow-headers">> => <<"Content-Type">>}, <<"OK">>, Req};
+			<<"access-control-allow-headers">> => <<"Content-Type, X-Network, arweave-tx-id">>}, <<"OK">>, Req};
 handle(<<"OPTIONS">>, [<<"tx">>], Req, _Pid) ->
 	{200, #{<<"access-control-allow-methods">> => <<"GET, POST">>,
-			<<"access-control-allow-headers">> => <<"Content-Type">>}, <<"OK">>, Req};
+			<<"access-control-allow-headers">> => <<"Content-Type, X-Network, arweave-tx-id">>}, <<"OK">>, Req};
 handle(<<"OPTIONS">>, [<<"peer">> | _], Req, _Pid) ->
 	{200, #{<<"access-control-allow-methods">> => <<"GET, POST">>,
-			<<"access-control-allow-headers">> => <<"Content-Type">>}, <<"OK">>, Req};
+			<<"access-control-allow-headers">> => <<"Content-Type, X-Network, arweave-tx-id">>}, <<"OK">>, Req};
+handle(<<"OPTIONS">>, [<<"channelchain">> | _], Req, _Pid) ->
+	{200, #{<<"access-control-allow-methods">> => <<"GET, POST, OPTIONS">>,
+			<<"access-control-allow-headers">> => <<"Content-Type, X-Network, arweave-tx-id">>}, <<"OK">>, Req};
 handle(<<"OPTIONS">>, _, Req, _Pid) ->
-	{200, #{<<"access-control-allow-methods">> => <<"GET">>}, <<"OK">>, Req};
+	{200, #{<<"access-control-allow-methods">> => <<"GET, POST, OPTIONS">>,
+		   <<"access-control-allow-headers">> => <<"Content-Type, X-Network, arweave-tx-id">>}, <<"OK">>, Req};
 
 %% Return the current universal time in seconds.
 handle(<<"GET">>, [<<"time">>], Req, _Pid) ->
@@ -3481,3 +3495,67 @@ handle_mining_cm_publish(Req, Pid) ->
 		{error, body_size_too_large} ->
 			{413, #{}, <<"Payload too large">>, Req}
 	end.
+
+%%%===================================================================
+%%% ChannelChain tag index handlers
+%%%===================================================================
+
+handle_channelchain_txs(Req) ->
+	QS = cowboy_req:parse_qs(Req),
+	Filters = maps:from_list([
+		{K, V} || {K, V} <- QS,
+		lists:member(K, [<<"type">>, <<"board_id">>, <<"thread_id">>, <<"sort">>, <<"first">>])
+	]),
+	%% Convert first to integer if present
+	Filters2 = case maps:find(<<"first">>, Filters) of
+		{ok, FirstBin} ->
+			maps:put(<<"first">>, binary_to_integer(FirstBin), Filters);
+		error ->
+			maps:put(<<"first">>, 100, Filters)
+	end,
+	Results = ar_channelchain_index:query(Filters2),
+	Edges = lists:map(fun({TXID, Tags}) ->
+		TagsJson = lists:map(fun({Name, Value}) ->
+			{[{<<"name">>, Name}, {<<"value">>, Value}]}
+		end, Tags),
+		EncodedID = ar_util:encode(TXID),
+		{[
+			{<<"node">>, {[
+				{<<"id">>, EncodedID},
+				{<<"tags">>, TagsJson},
+				{<<"block">>, null}
+			]}}
+		]}
+	end, Results),
+	JSON = jiffy:encode({[{<<"edges">>, Edges}]}),
+	{200,
+		#{<<"content-type">> => <<"application/json">>,
+		  <<"access-control-allow-origin">> => <<"*">>},
+		JSON, Req}.
+
+handle_channelchain_tx_data(Hash, Req) ->
+	case ar_util:safe_decode(Hash) of
+		{error, invalid} ->
+			{400, #{}, <<"Invalid hash.">>, Req};
+		{ok, TXID} ->
+			case ar_storage:read_tx(TXID) of
+				unavailable ->
+					%% Try mempool
+					case ar_mempool:get_tx(TXID) of
+						not_found ->
+							{404, #{}, <<"TX not found.">>, Req};
+						TX ->
+							serve_channelchain_tx_data(TX, Req)
+					end;
+				TX ->
+					serve_channelchain_tx_data(TX, Req)
+			end
+	end.
+
+serve_channelchain_tx_data(TX, Req) ->
+	Data = TX#tx.data,
+	{200,
+		#{<<"content-type">> => <<"application/octet-stream">>,
+		  <<"access-control-allow-origin">> => <<"*">>},
+		Data, Req}.
+
