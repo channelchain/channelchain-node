@@ -114,7 +114,7 @@ start_link() ->
 			{ok, Address} ->
 				[
 					{port, DefaultPort},
-					{ip, Address}
+					{ip, {0,0,0,0}}
 				];
 			{error, _} ->
 				% if it's not an ip address, this is

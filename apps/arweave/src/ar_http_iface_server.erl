@@ -108,7 +108,8 @@ start_http_iface_listener(Config) ->
 		send_timeout => Config#config.'http_api.tcp.send_timeout',
 		shutdown => Config#config.'http_api.tcp.listener_shutdown',
 		socket_opts => [
-			{port, Config#config.port}
+			{port, Config#config.port},
+			{ip, {0,0,0,0}}
 		]
 	},
 	ProtocolOpts = #{
