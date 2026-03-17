@@ -157,6 +157,7 @@ do_query(Filters) ->
     TypeFilter = maps:get(<<"type">>, Filters, undefined),
     BoardId = maps:get(<<"board_id">>, Filters, undefined),
     ThreadId = maps:get(<<"thread_id">>, Filters, undefined),
+    TargetTx = maps:get(<<"target_tx">>, Filters, undefined),
     First = maps:get(<<"first">>, Filters, 100),
     Sort = maps:get(<<"sort">>, Filters, <<"desc">>),
 
@@ -165,6 +166,20 @@ do_query(Filters) ->
         undefined ->
             %% Return all ChannelChain TXs
             all_txids();
+        <<"Admin-Op">> ->
+            lists:usort(
+                txids_for_tag(<<"Type">>, <<"Admin-Delete">>) ++
+                txids_for_tag(<<"Type">>, <<"Admin-Ban">>) ++
+                txids_for_tag(<<"Type">>, <<"Admin-Grant">>) ++
+                txids_for_tag(<<"Type">>, <<"Admin-Revoke">>) ++
+                txids_for_tag(<<"Type">>, <<"Moderator-Hide">>) ++
+                txids_for_tag(<<"Type">>, <<"Moderator-Ban">>)
+            );
+        <<"Moderator-Op">> ->
+            lists:usort(
+                txids_for_tag(<<"Type">>, <<"Moderator-Hide">>) ++
+                txids_for_tag(<<"Type">>, <<"Moderator-Ban">>)
+            );
         Type ->
             txids_for_tag(<<"Type">>, Type)
     end,
@@ -190,13 +205,23 @@ do_query(Filters) ->
             ))
     end,
 
+    Filtered3 = case TargetTx of
+        undefined -> Filtered2;
+        Tgt ->
+            TargetSet = txids_for_tag(<<"Target-TX">>, Tgt),
+            sets:to_list(sets:intersection(
+                sets:from_list(Filtered2),
+                sets:from_list(TargetSet)
+            ))
+    end,
+
     %% Fetch tags for each TX ID
     WithTags = lists:filtermap(fun(TXID) ->
         case ets:lookup(?TX_TAGS_TABLE, TXID) of
             [{TXID, Tags}] -> {true, {TXID, Tags}};
             [] -> false
         end
-    end, Filtered2),
+    end, Filtered3),
 
     %% Sort by insertion order (we use a simple ordering based on ETS)
     %% For now, preserve the found order and apply sort+limit

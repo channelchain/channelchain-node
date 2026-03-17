@@ -193,12 +193,24 @@ add_cors_headers(Req, Response) ->
 			{503, ?CORS_HEADERS, jiffy:encode(#{ error => timeout }), Req}
 	end.
 
--ifdef(TESTNET).
 handle4(<<"POST">>, [<<"mine">>], Req, _Pid) ->
+	case os:getenv("FAST_MINE") of
+		"true" ->
+			gen_server:cast(ar_node_worker, mine),
+			{200, #{}, <<"Mined">>, Req};
+		_ ->
+			{404, #{}, <<"Not Found">>, Req}
+	end;
+
+handle4(Method, SplitPath, Req, Pid) ->
+	handle5(Method, SplitPath, Req, Pid).
+
+-ifdef(TESTNET).
+handle5(<<"POST">>, [<<"mine_testnet">>], Req, _Pid) ->
 	ar_test_node:mine(),
 	{200, #{}, <<>>, Req};
 
-handle4(<<"GET">>, [<<"tx">>, <<"ready_for_mining">>], Req, _Pid) ->
+handle5(<<"GET">>, [<<"tx">>, <<"ready_for_mining">>], Req, _Pid) ->
 	{200, #{},
 			ar_serialize:jsonify(
 				lists:map(
@@ -208,10 +220,10 @@ handle4(<<"GET">>, [<<"tx">>, <<"ready_for_mining">>], Req, _Pid) ->
 			),
 	Req};
 
-handle4(Method, SplitPath, Req, Pid) ->
+handle5(Method, SplitPath, Req, Pid) ->
 	handle(Method, SplitPath, Req, Pid).
 -else.
-handle4(Method, SplitPath, Req, Pid) ->
+handle5(Method, SplitPath, Req, Pid) ->
 	handle(Method, SplitPath, Req, Pid).
 -endif.
 
@@ -2091,9 +2103,14 @@ handle_post_tx(Req, Peer, TX) ->
 		{invalid, invalid_data_root_size} ->
 			handle_post_tx_invalid_data_root_response();
 		{valid, TX2} ->
-			ar_data_sync:add_data_root_to_disk_pool(TX2#tx.data_root, TX2#tx.data_size,
-					TX#tx.id),
-			handle_post_tx_accepted(Req, TX, Peer)
+			case ar_admin:validate_admin_tx(TX2) of
+				false ->
+					{error_response, {403, #{}, <<"Unauthorized admin transaction.">>}};
+				true ->
+					ar_data_sync:add_data_root_to_disk_pool(TX2#tx.data_root, TX2#tx.data_size,
+							TX#tx.id),
+					handle_post_tx_accepted(Req, TX, Peer)
+			end
 	end.
 
 handle_post_tx_accepted(Req, TX, Peer) ->
@@ -3504,7 +3521,7 @@ handle_channelchain_txs(Req) ->
 	QS = cowboy_req:parse_qs(Req),
 	Filters = maps:from_list([
 		{K, V} || {K, V} <- QS,
-		lists:member(K, [<<"type">>, <<"board_id">>, <<"thread_id">>, <<"sort">>, <<"first">>])
+		lists:member(K, [<<"type">>, <<"board_id">>, <<"thread_id">>, <<"target_tx">>, <<"sort">>, <<"first">>])
 	]),
 	%% Convert first to integer if present
 	Filters2 = case maps:find(<<"first">>, Filters) of
@@ -3558,4 +3575,3 @@ serve_channelchain_tx_data(TX, Req) ->
 		#{<<"content-type">> => <<"application/octet-stream">>,
 		  <<"access-control-allow-origin">> => <<"*">>},
 		Data, Req}.
-

@@ -45,15 +45,20 @@ update_accounts(B, PrevB, Accounts) ->
 	Denomination = PrevB#block.denomination,
 	DebtSupply = PrevB#block.debt_supply,
 	TXs = B#block.txs,
-	BlockInterval = ar_block_time_history:compute_block_interval(PrevB),
-	Args =
-		get_miner_reward_and_endowment_pool({EndowmentPool, DebtSupply, TXs,
-				B#block.reward_addr, B#block.weave_size, B#block.height, B#block.timestamp,
-				Rate, PricePerGiBMinute, KryderPlusRateMultiplierLatch,
-				KryderPlusRateMultiplier, Denomination, BlockInterval}),
-	Accounts2 = apply_txs(Accounts, Denomination, TXs),
-	true = B#block.height >= ar_fork:height_2_6(),
-	update_accounts2(B, PrevB, Accounts2, Args).
+	case ar_admin:validate_block_txs(TXs) of
+		ok ->
+			BlockInterval = ar_block_time_history:compute_block_interval(PrevB),
+			Args =
+				get_miner_reward_and_endowment_pool({EndowmentPool, DebtSupply, TXs,
+						B#block.reward_addr, B#block.weave_size, B#block.height, B#block.timestamp,
+						Rate, PricePerGiBMinute, KryderPlusRateMultiplierLatch,
+						KryderPlusRateMultiplier, Denomination, BlockInterval}),
+			Accounts2 = apply_txs(Accounts, Denomination, TXs),
+			true = B#block.height >= ar_fork:height_2_6(),
+			update_accounts2(B, PrevB, Accounts2, Args);
+		Error ->
+			Error
+	end.
 
 %% @doc Perform the last stage of block validation. The majority of the checks
 %% are made in ar_block_pre_validator.erl, ar_nonce_limiter.erl, and

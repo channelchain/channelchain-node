@@ -15,6 +15,13 @@ get_info() ->
 	{Time2, Height} =
 		timer:tc(fun() -> ar_node:get_height() end),
 	[{_, BlockCount}] = ets:lookup(ar_header_sync, synced_blocks),
+	AdminPoolBalance = ar_admin:get_admin_pool_balance(),
+	AdminAddresses = [format_admin_address(Addr) || Addr <- ar_admin:get_admin_addresses()],
+	WalletRoles = maps:from_list([{format_admin_address(Addr), Role} || {Addr, Role} <- maps:to_list(ar_admin:get_wallet_roles())]),
+	WalletCapabilities = maps:from_list([
+		{format_admin_address(Addr), Caps}
+		|| {Addr, Caps} <- maps:to_list(ar_admin:get_wallet_capabilities())
+	]),
     #{
         <<"network">> => list_to_binary(?NETWORK_NAME),
         <<"version">> => ?CLIENT_VERSION,
@@ -36,8 +43,17 @@ get_info() ->
                 2,
                 erlang:process_info(whereis(ar_node_worker), message_queue_len)
             ),
-        <<"node_state_latency">> => (Time + Time2) div 2
+        <<"node_state_latency">> => (Time + Time2) div 2,
+        <<"admin_pool_balance">> => AdminPoolBalance,
+        <<"admin_addresses">> => AdminAddresses,
+        <<"wallet_roles">> => WalletRoles,
+        <<"wallet_capabilities">> => WalletCapabilities
     }.
+
+format_admin_address(Addr) when is_binary(Addr), byte_size(Addr) == 32 ->
+	ar_util:encode(Addr);
+format_admin_address(Addr) ->
+	Addr.
 
 get_recent() ->
     #{
@@ -119,4 +135,3 @@ get_block_timestamp(B, Depth)
     <<"pending">>;
 get_block_timestamp(B, _Depth) ->
     ar_util:timestamp_to_seconds(B#block.receive_timestamp).
-

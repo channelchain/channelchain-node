@@ -158,6 +158,7 @@ init([]) ->
 	ets:insert(node_state, [
 		{is_joined,						false},
 		{hash_list_2_0_for_1_0_blocks,	read_hash_list_2_0_for_1_0_blocks()}
+		| ar_admin:initial_state_entries()
 	]),
 	gen_server:cast(?MODULE, compute_mining_difficulty),
 	{ok, #{
@@ -456,6 +457,7 @@ handle_info({event, nonce_limiter, initialized}, State) ->
 		{redenomination_height, B#block.redenomination_height},
 		{scheduled_price_per_gib_minute, B#block.scheduled_price_per_gib_minute},
 		{merkle_rebase_support_threshold, get_merkle_rebase_threshold(B)}
+		| ar_admin:current_state_entries()
 	]),
 	SearchSpaceUpperBound = ar_node:get_partition_upper_bound(RecentBI),
 	ar_events:send(node_state, {search_space_upper_bound, SearchSpaceUpperBound}),
@@ -544,8 +546,8 @@ handle_info({event, block, _}, State) ->
 %% Add the new waiting transaction to the server state.
 handle_info({event, tx, {new, TX, _Source}}, State) ->
 	TXID = TX#tx.id,
-	case ar_mempool:has_tx(TXID) of
-		false ->
+	case {ar_mempool:has_tx(TXID), ar_admin:validate_admin_tx(TX)} of
+		{false, true} ->
 			InitialStatus =
 				case maps:get(automine, State) of
 					false ->
@@ -565,12 +567,10 @@ handle_info({event, tx, {new, TX, _Source}}, State) ->
 							ok
 					end;
 				false ->
-					%% The transaction has been dropped because more valuable transactions
-					%% exceed the mempool limit.
 					ok
 			end,
 			{noreply, State};
-		true ->
+		_ ->
 			{noreply, State}
 	end;
 
@@ -1479,6 +1479,14 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 	ar_storage:update_block_index(B#block.height, OrphanCount, AddedBIElements),
 	ar_storage:store_reward_history_part(AddedBlocks),
 	ar_storage:store_block_time_history_part(AddedBlocks, ForkRootB),
+	{AdminAddresses2, WalletRoles2, AdminPoolBalance2} =
+		case ar_admin:apply_admin_txs(B#block.txs,
+				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(), ar_admin:get_admin_pool_balance()}) of
+			{ok, State2} ->
+				State2;
+			{error, _} ->
+				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(), ar_admin:get_admin_pool_balance()}
+		end,
 	ets:insert(node_state, [
 		{recent_block_index,	RecentBI2},
 		{recent_max_block_size, get_max_block_size(RecentBI2)},
@@ -1503,7 +1511,10 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 		{denomination, B#block.denomination},
 		{redenomination_height, B#block.redenomination_height},
 		{scheduled_price_per_gib_minute, B#block.scheduled_price_per_gib_minute},
-		{merkle_rebase_support_threshold, get_merkle_rebase_threshold(B)}
+		{merkle_rebase_support_threshold, get_merkle_rebase_threshold(B)},
+		{admin_addresses, AdminAddresses2},
+		{wallet_roles, WalletRoles2},
+		{admin_pool_balance, AdminPoolBalance2}
 	]),
 	SearchSpaceUpperBound = ar_node:get_partition_upper_bound(RecentBI),
 	ar_events:send(node_state, {search_space_upper_bound, SearchSpaceUpperBound}),

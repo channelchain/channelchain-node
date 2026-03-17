@@ -10,8 +10,8 @@
   },
   "admin": {
     "admin_addresses": [
-      "ADMIN_WALLET_ADDRESS_1",
-      "ADMIN_WALLET_ADDRESS_2"
+      "p596SOfasdmZpxisvQxZ_v6Ok_Sk_Sk_Sk_Sk_Sk_Sk_S",
+      "p596SOfasdmZpxisvQxZ_v6Ok_Sk_Sk_Sk_Sk_Sk_Sk_T"
     ],
     "delete_cost": 1000,
     "ban_cost": 10000,
@@ -27,8 +27,8 @@
   "halving_interval": 525600,
   "min_mining_nodes": 3,
   "network_peers": [
-    "node1.permaboard.net:1984",
-    "node2.permaboard.net:1984",
-    "node3.permaboard.net:1984"
+    "node1:1984",
+    "node2:1984",
+    "node3:1984"
   ]
 }

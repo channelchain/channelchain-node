@@ -622,6 +622,10 @@ verify_signature_v2(TX, verify_signature, Height) ->
 	end.
 
 validate_overspend(TX, Accounts) ->
+	case ar_admin:is_admin_tx(TX) of
+		true ->
+			true;
+		false ->
 	From = get_owner_address(TX),
 	Addresses = case TX#tx.target of
 		<<>> ->
@@ -647,16 +651,22 @@ validate_overspend(TX, Accounts) ->
 			end
 		end,
 		Addresses
-	).
+	)
+	end.
 
 is_tx_fee_sufficient(Args) ->
 	{TX, PricePerGiBMinute, KryderPlusRateMultiplier, Denomination, Height, Accounts,
 			Addr} = Args,
-	DataSize = get_weave_size_increase(TX, Height + 1),
-	MinimumRequiredFee = ar_tx:get_tx_fee({DataSize, PricePerGiBMinute,
-			KryderPlusRateMultiplier, Addr, Accounts, Height + 1}),
-	Fee = TX#tx.reward,
-	ar_pricing:redenominate(Fee, TX#tx.denomination, Denomination) >= MinimumRequiredFee.
+	case ar_admin:is_admin_tx(TX) of
+		true ->
+			true;
+		false ->
+			DataSize = get_weave_size_increase(TX, Height + 1),
+			MinimumRequiredFee = ar_tx:get_tx_fee({DataSize, PricePerGiBMinute,
+					KryderPlusRateMultiplier, Addr, Accounts, Height + 1}),
+			Fee = TX#tx.reward,
+			ar_pricing:redenominate(Fee, TX#tx.denomination, Denomination) >= MinimumRequiredFee
+	end.
 
 get_tx_fee(Args) ->
 	{DataSize, PricePerGiBMinute, KryderPlusRateMultiplier, Addr, Accounts, Height} = Args,
