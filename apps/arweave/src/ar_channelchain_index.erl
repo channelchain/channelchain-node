@@ -12,7 +12,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, add_tx/1, query/1]).
+-export([start_link/0, add_tx/1, query/1, is_deleted/1, board_stats/1, thread_stats/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
@@ -20,6 +20,7 @@
 %% ETS table names
 -define(TX_TAGS_TABLE, channelchain_tx_tags).
 -define(TX_INDEX_TABLE, channelchain_tx_index).
+-define(DELETED_TXS_TABLE, channelchain_deleted_txs).
 -define(APP_NAME, <<"ChannelChain">>).
 
 %%%===================================================================
@@ -38,6 +39,18 @@ add_tx(TX) when is_record(TX, tx) ->
 query(Filters) ->
     gen_server:call(?MODULE, {query, Filters}, 10000).
 
+%% @doc Check if a TX is marked as deleted.
+is_deleted(TXID) ->
+    ets:member(?DELETED_TXS_TABLE, TXID).
+
+%% @doc Get stats (thread_count, post_count) for a board, filtering deleted/closed.
+board_stats(BoardId) ->
+    gen_server:call(?MODULE, {board_stats, BoardId}, 10000).
+
+%% @doc Get post_count for a thread, filtering deleted.
+thread_stats(ThreadId) ->
+    gen_server:call(?MODULE, {thread_stats, ThreadId}, 10000).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -48,6 +61,8 @@ init([]) ->
         [set, public, named_table, {read_concurrency, true}]),
     ets:new(?TX_INDEX_TABLE,
         [bag, public, named_table, {read_concurrency, true}]),
+    ets:new(?DELETED_TXS_TABLE,
+        [set, public, named_table, {read_concurrency, true}]),
     %% Subscribe to tx events (new TX received by node)
     ar_events:subscribe(tx),
     %% Subscribe to block events (TX confirmed in block)
@@ -58,6 +73,18 @@ init([]) ->
 
 handle_call({query, Filters}, _From, State) ->
     Result = do_query(Filters),
+    {reply, Result, State};
+
+handle_call({board_stats, BoardId}, _From, State) ->
+    Result = do_board_stats(BoardId),
+    {reply, Result, State};
+
+handle_call({thread_stats, ThreadId}, _From, State) ->
+    Result = do_thread_stats(ThreadId),
+    {reply, Result, State};
+
+handle_call({board_thread_post_counts, BoardId}, _From, State) ->
+    Result = board_thread_post_counts(BoardId),
     {reply, Result, State};
 
 handle_call(_Request, _From, State) ->
@@ -71,6 +98,7 @@ handle_cast(build_index, State) ->
     %% Build index from confirmed TXs stored on disk.
     %% We scan the mempool and confirmed TX files.
     build_from_mempool(),
+    build_from_chain(),
     {noreply, State};
 
 handle_cast(_Msg, State) ->
@@ -118,6 +146,24 @@ maybe_index_tx(TX) when is_record(TX, tx) ->
     case get_tag_value(Tags, <<"App-Name">>) of
         ?APP_NAME ->
             TXID = TX#tx.id,
+            Type = get_tag_value(Tags, <<"Type">>),
+            
+            %% If it's a deletion TX, mark the target as deleted
+            case Type of
+                <<"Admin-Delete">> ->
+                    case get_tag_value(Tags, <<"Target-TX">>) of
+                        undefined -> ok;
+                        TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
+                    end;
+                <<"Moderator-Hide">> ->
+                    case get_tag_value(Tags, <<"Target-TX">>) of
+                        undefined -> ok;
+                        TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
+                    end;
+                _ ->
+                    ok
+            end,
+
             %% Store {txid, tags}
             ets:insert(?TX_TAGS_TABLE, {TXID, Tags}),
             %% Build inverted index: {TagName, TagValue, TXID}
@@ -151,6 +197,29 @@ build_from_mempool() ->
         end
     end, PendingTXIDs).
 
+%% @doc Build index from confirmed blocks.
+build_from_chain() ->
+    case catch ar_storage:read_block_index() of
+        {'EXIT', _} -> ok;
+        not_found -> ok;
+        BlockIndex when is_list(BlockIndex) ->
+            lists:foreach(
+                fun(BlockRef) ->
+                    case ar_storage:read_block(BlockRef) of
+                        unavailable -> ok;
+                        #block{txs = TXs} ->
+                            lists:foreach(fun(TXID) ->
+                                case ar_storage:read_tx(TXID) of
+                                    unavailable -> ok;
+                                    TX -> maybe_index_tx(TX)
+                                end
+                            end, TXs)
+                    end
+                end,
+                lists:reverse(BlockIndex)
+            )
+    end.
+
 %% @doc Query the ETS index.
 %% Returns a list of {TXID, Tags} matching all given filters.
 do_query(Filters) ->
@@ -160,6 +229,7 @@ do_query(Filters) ->
     TargetTx = maps:get(<<"target_tx">>, Filters, undefined),
     First = maps:get(<<"first">>, Filters, 100),
     Sort = maps:get(<<"sort">>, Filters, <<"desc">>),
+    IncludeClosed = maps:get(<<"include_closed">>, Filters, false),
 
     %% Start from the smallest result set (most selective filter first)
     InitialSet = case TypeFilter of
@@ -172,6 +242,7 @@ do_query(Filters) ->
                 txids_for_tag(<<"Type">>, <<"Admin-Ban">>) ++
                 txids_for_tag(<<"Type">>, <<"Admin-Grant">>) ++
                 txids_for_tag(<<"Type">>, <<"Admin-Revoke">>) ++
+                txids_for_tag(<<"Type">>, <<"Admin-Board-Close">>) ++
                 txids_for_tag(<<"Type">>, <<"Moderator-Hide">>) ++
                 txids_for_tag(<<"Type">>, <<"Moderator-Ban">>)
             );
@@ -215,11 +286,32 @@ do_query(Filters) ->
             ))
     end,
 
-    %% Fetch tags for each TX ID
+    %% Fetch tags for each TX ID, filtering out deleted ones
     WithTags = lists:filtermap(fun(TXID) ->
-        case ets:lookup(?TX_TAGS_TABLE, TXID) of
-            [{TXID, Tags}] -> {true, {TXID, Tags}};
-            [] -> false
+        case ets:member(?DELETED_TXS_TABLE, TXID) of
+            true -> false;
+            false ->
+                case ets:lookup(?TX_TAGS_TABLE, TXID) of
+                    [{TXID, Tags}] ->
+                        %% Don't filter out admin operations based on board status
+                        %% so that logs still appear in the admin dashboard.
+                        case TypeFilter of
+                            <<"Admin-Op">> -> {true, {TXID, Tags}};
+                            <<"Moderator-Op">> -> {true, {TXID, Tags}};
+                            _ ->
+                                case IncludeClosed of
+                                    true -> {true, {TXID, Tags}};
+                                    false ->
+                                        %% For regular queries (Board, Thread, Post), check if the board is closed
+                                        BoardIdFromTags = get_tag_value(Tags, <<"Board-Id">>),
+                                        case BoardIdFromTags =/= undefined andalso ar_admin:is_board_closed(BoardIdFromTags) of
+                                            true -> false;
+                                            false -> {true, {TXID, Tags}}
+                                        end
+                                end
+                        end;
+                    [] -> false
+                end
         end
     end, Filtered3),
 
@@ -245,3 +337,49 @@ txids_for_tag(Name, Value) ->
 get_tag_value([], _Name) -> undefined;
 get_tag_value([{Name, Value} | _], Name) -> Value;
 get_tag_value([_ | Tags], Name) -> get_tag_value(Tags, Name).
+
+%% @doc Compute board stats (thread_count, post_count) efficiently.
+%% Filters out deleted and closed-board items.
+do_board_stats(BoardId) ->
+    BoardTXIDs = txids_for_tag(<<"Board-Id">>, BoardId),
+    ThreadCount = count_active(BoardTXIDs, <<"Thread">>),
+    PostCount = count_active(BoardTXIDs, <<"Post">>),
+    #{thread_count => ThreadCount, post_count => PostCount}.
+
+count_active(BoardTXIDs, Type) ->
+    TypeTXIDs = txids_for_tag(<<"Type">>, Type),
+    Intersection = sets:to_list(sets:intersection(
+        sets:from_list(BoardTXIDs), sets:from_list(TypeTXIDs))),
+    lists:foldl(fun(TXID, Acc) ->
+        case ets:member(?DELETED_TXS_TABLE, TXID) of
+            true -> Acc;
+            false -> Acc + 1
+        end
+    end, 0, Intersection).
+
+%% @doc Compute thread stats (post_count) efficiently.
+do_thread_stats(ThreadId) ->
+    ThreadTXIDs = txids_for_tag(<<"Thread-Id">>, ThreadId),
+    PostCount = count_active(ThreadTXIDs, <<"Post">>),
+    #{post_count => PostCount}.
+
+%% @doc Compute post counts for all threads under a board.
+%% Returns a map: #{ThreadId => PostCount}.
+board_thread_post_counts(BoardId) ->
+    BoardTXIDs = sets:from_list(txids_for_tag(<<"Board-Id">>, BoardId)),
+    PostTXIDs = sets:from_list(txids_for_tag(<<"Type">>, <<"Post">>)),
+    BoardPosts = sets:to_list(sets:intersection(BoardTXIDs, PostTXIDs)),
+    lists:foldl(fun(TXID, Acc) ->
+        case ets:member(?DELETED_TXS_TABLE, TXID) of
+            true -> Acc;
+            false ->
+                case ets:lookup(?TX_TAGS_TABLE, TXID) of
+                    [{TXID, Tags}] ->
+                        case get_tag_value(Tags, <<"Thread-Id">>) of
+                            undefined -> Acc;
+                            TId -> maps:put(TId, maps:get(TId, Acc, 0) + 1, Acc)
+                        end;
+                    [] -> Acc
+                end
+        end
+    end, #{}, BoardPosts).

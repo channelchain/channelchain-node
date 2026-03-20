@@ -22,6 +22,7 @@ get_info() ->
 		{format_admin_address(Addr), Caps}
 		|| {Addr, Caps} <- maps:to_list(ar_admin:get_wallet_capabilities())
 	]),
+	ClosedBoards = ar_admin:get_closed_boards(),
     #{
         <<"network">> => list_to_binary(?NETWORK_NAME),
         <<"version">> => ?CLIENT_VERSION,
@@ -47,7 +48,9 @@ get_info() ->
         <<"admin_pool_balance">> => AdminPoolBalance,
         <<"admin_addresses">> => AdminAddresses,
         <<"wallet_roles">> => WalletRoles,
-        <<"wallet_capabilities">> => WalletCapabilities
+        <<"wallet_capabilities">> => WalletCapabilities,
+        <<"closed_boards">> => ClosedBoards,
+        <<"pow_difficulty">> => ar_pow_verify:get_current_difficulty()
     }.
 
 format_admin_address(Addr) when is_binary(Addr), byte_size(Addr) == 32 ->

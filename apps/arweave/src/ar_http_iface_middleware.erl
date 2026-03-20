@@ -197,20 +197,24 @@ handle4(<<"POST">>, [<<"mine">>], Req, _Pid) ->
 	case os:getenv("FAST_MINE") of
 		"true" ->
 			gen_server:cast(ar_node_worker, mine),
+			%% Also refresh admin state from mempool so that admin effects
+			%% (board close, grants, etc.) are immediately visible via /info
+			%% even before blocks are actually mined.
+			ar_admin:refresh_state(),
 			{200, #{}, <<"Mined">>, Req};
 		_ ->
 			{404, #{}, <<"Not Found">>, Req}
 	end;
 
 handle4(Method, SplitPath, Req, Pid) ->
-	handle5(Method, SplitPath, Req, Pid).
+	handle_testnet(Method, SplitPath, Req, Pid).
 
 -ifdef(TESTNET).
-handle5(<<"POST">>, [<<"mine_testnet">>], Req, _Pid) ->
+handle_testnet(<<"POST">>, [<<"mine_testnet">>], Req, _Pid) ->
 	ar_test_node:mine(),
 	{200, #{}, <<>>, Req};
 
-handle5(<<"GET">>, [<<"tx">>, <<"ready_for_mining">>], Req, _Pid) ->
+handle_testnet(<<"GET">>, [<<"tx">>, <<"ready_for_mining">>], Req, _Pid) ->
 	{200, #{},
 			ar_serialize:jsonify(
 				lists:map(
@@ -220,10 +224,10 @@ handle5(<<"GET">>, [<<"tx">>, <<"ready_for_mining">>], Req, _Pid) ->
 			),
 	Req};
 
-handle5(Method, SplitPath, Req, Pid) ->
+handle_testnet(Method, SplitPath, Req, Pid) ->
 	handle(Method, SplitPath, Req, Pid).
 -else.
-handle5(Method, SplitPath, Req, Pid) ->
+handle_testnet(Method, SplitPath, Req, Pid) ->
 	handle(Method, SplitPath, Req, Pid).
 -endif.
 
@@ -233,6 +237,11 @@ handle5(Method, SplitPath, Req, Pid) ->
 %% GET /channelchain/txs?type=Board&board_id=...&thread_id=...&first=N&sort=desc
 handle(<<"GET">>, [<<"channelchain">>, <<"txs">>], Req, _Pid) ->
 	handle_channelchain_txs(Req);
+
+%% ChannelChain: Board stats endpoint.
+%% GET /channelchain/stats?board_id=xxx
+handle(<<"GET">>, [<<"channelchain">>, <<"stats">>], Req, _Pid) ->
+	handle_channelchain_stats(Req);
 
 %% ChannelChain: TX data endpoint.
 %% GET /channelchain/tx/{hash}/data
@@ -2087,7 +2096,14 @@ handle_post_tx({Req, Pid, Encoding}) ->
 	end.
 
 handle_post_tx(Req, Peer, TX) ->
-	case ar_tx_validator:validate(TX) of
+	io:format("DEBUG_POST_TX: ID=~p, Format=~p, Tags=~p, Owner=~p, Size=~p, Reward=~p~n",
+		[TX#tx.id, TX#tx.format, TX#tx.tags, TX#tx.owner, TX#tx.data_size, TX#tx.reward]),
+	ValResult = ar_tx_validator:validate(TX),
+	?LOG_ERROR([{event, debug_post_tx_val_result}, {tx_id, TX#tx.id}, {result, ValResult}]),
+	io:format("===================> VALIDATE RESULT: ~p~n", [ValResult]),
+	case ValResult of
+		{invalid, {tx_verification_failed, ErrorCodes}} ->
+			handle_post_tx_verification_response(ErrorCodes);
 		{invalid, tx_verification_failed} ->
 			handle_post_tx_verification_response();
 		{invalid, last_tx_in_mempool} ->
@@ -2132,6 +2148,10 @@ handle_post_tx_accepted(Req, TX, Peer) ->
 
 handle_post_tx_verification_response() ->
 	{error_response, {400, #{}, <<"Transaction verification failed.">>}}.
+
+handle_post_tx_verification_response(ErrorCodes) ->
+	ErrMsg = iolist_to_binary(io_lib:format("Transaction verification failed: ~p", [ErrorCodes])),
+	{error_response, {400, #{}, ErrMsg}}.
 
 handle_post_tx_last_tx_in_mempool_response() ->
 	{error_response, {400, #{}, <<"Invalid anchor (last_tx from mempool).">>}}.
@@ -3521,7 +3541,7 @@ handle_channelchain_txs(Req) ->
 	QS = cowboy_req:parse_qs(Req),
 	Filters = maps:from_list([
 		{K, V} || {K, V} <- QS,
-		lists:member(K, [<<"type">>, <<"board_id">>, <<"thread_id">>, <<"target_tx">>, <<"sort">>, <<"first">>])
+		lists:member(K, [<<"type">>, <<"board_id">>, <<"thread_id">>, <<"target_tx">>, <<"sort">>, <<"first">>, <<"include_closed">>])
 	]),
 	%% Convert first to integer if present
 	Filters2 = case maps:find(<<"first">>, Filters) of
@@ -3530,7 +3550,14 @@ handle_channelchain_txs(Req) ->
 		error ->
 			maps:put(<<"first">>, 100, Filters)
 	end,
-	Results = ar_channelchain_index:query(Filters2),
+	%% Convert include_closed to boolean
+	Filters3 = case maps:find(<<"include_closed">>, Filters2) of
+		{ok, <<"true">>} ->
+			maps:put(<<"include_closed">>, true, Filters2);
+		_ ->
+			maps:put(<<"include_closed">>, false, Filters2)
+	end,
+	Results = ar_channelchain_index:query(Filters3),
 	Edges = lists:map(fun({TXID, Tags}) ->
 		TagsJson = lists:map(fun({Name, Value}) ->
 			{[{<<"name">>, Name}, {<<"value">>, Value}]}
@@ -3549,6 +3576,27 @@ handle_channelchain_txs(Req) ->
 		#{<<"content-type">> => <<"application/json">>,
 		  <<"access-control-allow-origin">> => <<"*">>},
 		JSON, Req}.
+
+handle_channelchain_stats(Req) ->
+	QS = cowboy_req:parse_qs(Req),
+	case proplists:get_value(<<"board_id">>, QS) of
+		undefined ->
+			{400, #{}, <<"board_id is required">>, Req};
+		BoardId ->
+			Stats = ar_channelchain_index:board_stats(BoardId),
+			ThreadPostCounts = gen_server:call(ar_channelchain_index, {board_thread_post_counts, BoardId}, 10000),
+			%% Convert thread post counts map to JSON object
+			ThreadPostCountsJson = {maps:to_list(ThreadPostCounts)},
+			JSON = jiffy:encode({[
+				{<<"thread_count">>, maps:get(thread_count, Stats, 0)},
+				{<<"post_count">>, maps:get(post_count, Stats, 0)},
+				{<<"thread_post_counts">>, ThreadPostCountsJson}
+			]}),
+			{200,
+				#{<<"content-type">> => <<"application/json">>,
+				  <<"access-control-allow-origin">> => <<"*">>},
+				JSON, Req}
+	end.
 
 handle_channelchain_tx_data(Hash, Req) ->
 	case ar_util:safe_decode(Hash) of

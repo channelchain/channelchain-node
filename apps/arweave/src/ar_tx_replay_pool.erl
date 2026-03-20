@@ -109,13 +109,18 @@ verify_tx2(Args) ->
 	{TX, Rate, PricePerGiBMinute, KryderPlusRateMultiplier, Denomination, Height,
 			RedenominationHeight, Timestamp, FloatingWallets, BlockAnchors, RecentTXMap,
 			Mempool, VerifySignature} = Args,
+
+	VerifyResult = ar_tx:verify(TX, {Rate, PricePerGiBMinute, KryderPlusRateMultiplier, Denomination,
+			RedenominationHeight, Height, FloatingWallets, Timestamp}, VerifySignature),
+	io:format("===================> DEBUG_AR_TX_VERIFY_RESULT: ~p, TXID: ~p~n", [VerifyResult, TX#tx.id]),
 	
-	case ar_tx:verify(TX, {Rate, PricePerGiBMinute, KryderPlusRateMultiplier, Denomination,
-			RedenominationHeight, Height, FloatingWallets, Timestamp}, VerifySignature) of
+	case VerifyResult of
 		true ->
 			verify_anchor(TX, Height, FloatingWallets, BlockAnchors, RecentTXMap, Mempool);
+		{false, ErrorCodes} ->
+			erlang:error({tx_verification_failed_forced_crash, TX#tx.id, ErrorCodes});
 		false ->
-			{invalid, tx_verification_failed}
+			erlang:error({tx_verification_failed_forced_crash, TX#tx.id, unknown})
 	end.
 
 verify_anchor(TX, Height, FloatingWallets, BlockAnchors, RecentTXMap, Mempool) when

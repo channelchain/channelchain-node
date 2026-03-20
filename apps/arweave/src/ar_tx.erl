@@ -426,6 +426,7 @@ collect_validation_results(TXID, Checks) ->
 		({_, true}) ->
 			false;
 		({ErrorCode, false}) ->
+			io:format("===================> DEBUG_TX_FAILED: ~p at ~p~n", [TXID, ErrorCode]),
 			{true, ErrorCode}
 	end,
 	case lists:filtermap(KeepFailed, Checks) of
@@ -433,7 +434,7 @@ collect_validation_results(TXID, Checks) ->
 			true;
 		ErrorCodes ->
 			ar_tx_db:put_error_codes(TXID, ErrorCodes),
-			false
+			{false, ErrorCodes}
 	end.
 
 do_verify_v2(TX, Args, VerifySignature) ->
@@ -657,7 +658,8 @@ validate_overspend(TX, Accounts) ->
 is_tx_fee_sufficient(Args) ->
 	{TX, PricePerGiBMinute, KryderPlusRateMultiplier, Denomination, Height, Accounts,
 			Addr} = Args,
-	case ar_admin:is_admin_tx(TX) of
+	IsAdmin = ar_admin:is_admin_tx(TX),
+	case IsAdmin of
 		true ->
 			true;
 		false ->
