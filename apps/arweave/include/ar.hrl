@@ -80,7 +80,7 @@
 -define(ECDSA_SIG_SIZE, 65).
 
 %% The difficulty a new weave is started with.
--define(DEFAULT_DIFF, 6).
+-define(DEFAULT_DIFF, 1).
 
 -ifndef(TARGET_BLOCK_TIME).
 -define(TARGET_BLOCK_TIME, 120).
@@ -369,7 +369,7 @@
 -define(PADDING_NODE_DATA_ROOT, <<>>).
 
 -ifndef(INITIAL_VDF_DIFFICULTY).
--define(INITIAL_VDF_DIFFICULTY, 600_000).
+-define(INITIAL_VDF_DIFFICULTY, 2).
 -endif.
 
 %% @doc A chunk with the proofs of its presence in the weave at a particular offset.

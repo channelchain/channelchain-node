@@ -1,6 +1,6 @@
 -module(ar_inflation).
 
--export([calculate_reward/2, process_donation/2]).
+-export([calculate/1, blocks_per_year/1, calculate_reward/2, process_donation/2]).
 
 -include_lib("arweave/include/ar.hrl").
 
@@ -9,6 +9,15 @@
 -define(BLOCK_REWARD,              1000000).  %% 1 TOKEN/ブロック（基金から） - 1 AR is 1_000_000_000_000 winston. Wait, the spec says 1,000,000 winston.
 -define(INFLATION_REWARD,           100000).  %% 0.1 TOKEN/ブロック（新規発行）
 -define(HALVING_INTERVAL,           525600).  %% 約1年ごとに半減（2分/ブロック想定）
+
+%% @doc Return the inflation reward for a given block height.
+calculate(Height) ->
+	Halvings = Height div ?HALVING_INTERVAL,
+	?INFLATION_REWARD bsr Halvings.
+
+%% @doc Return the expected number of blocks per year.
+blocks_per_year(_Height) ->
+	?HALVING_INTERVAL.
 
 %% @doc Calculate minor reward and return {TotalReward, NewEndowmentPool}
 calculate_reward(Height, EndowmentPool) ->

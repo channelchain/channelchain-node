@@ -141,7 +141,7 @@
 
 %% Increase the difficulty of PoA1 solutions by this multiplier (e.g. 100x).
 -ifndef(POA1_DIFF_MULTIPLIER).
--define(POA1_DIFF_MULTIPLIER, 100).
+-define(POA1_DIFF_MULTIPLIER, 1).
 -endif.
 
 %% The number of nonce limiter steps sharing the entropy. We add the entropy

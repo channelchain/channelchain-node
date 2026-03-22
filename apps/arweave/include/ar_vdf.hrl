@@ -7,7 +7,7 @@
 -define(VDF_SHA_1S, 15_000_000).
 
 -ifndef(VDF_DIFFICULTY).
-	-define(VDF_DIFFICULTY, ?VDF_SHA_1S div ?VDF_CHECKPOINT_COUNT_IN_STEP).
+-define(VDF_DIFFICULTY, 2).
 -endif.
 
 -ifdef(AR_TEST).

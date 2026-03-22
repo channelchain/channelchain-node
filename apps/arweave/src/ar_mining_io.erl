@@ -64,9 +64,13 @@ get_partitions(PartitionUpperBound) when PartitionUpperBound =< 0 ->
 	[];
 get_partitions(PartitionUpperBound) ->
 	Max = ar_node:get_max_partition_number(PartitionUpperBound),
+	{ok, Config} = arweave_config:get_env(),
 	AllPartitions = lists:foldl(
 		fun	(Module, Acc) ->
-				Addr = ar_storage_module:module_address(Module),
+				Addr = case ar_storage_module:module_address(Module) of
+					undefined -> Config#config.mining_addr;
+					A -> A
+				end,
 				PackingDifficulty =
 					ar_storage_module:module_packing_difficulty(Module),
 				{Start, End} = ar_storage_module:module_range(Module, 0),
@@ -94,7 +98,8 @@ get_minable_storage_modules() ->
 	{ok, Config} = arweave_config:get_env(),
 	lists:filter(
 		fun	(Module) ->
-				ar_storage_module:module_address(Module) == Config#config.mining_addr
+				Addr = ar_storage_module:module_address(Module),
+				Addr == Config#config.mining_addr orelse Addr == undefined
 		end,
 		Config#config.storage_modules
 	).

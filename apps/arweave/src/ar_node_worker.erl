@@ -165,6 +165,7 @@ init([]) ->
 		miner_state => undefined,
 		io_threads => [],
 		automine => false,
+		genesis_sync_pending => false,
 		tags => [],
 		blocks_missing_txs => sets:new(),
 		missing_txs_lookup_processes => #{},
@@ -469,7 +470,43 @@ handle_info({event, nonce_limiter, initialized}, State) ->
 	?LOG_INFO([{event, joined_the_network}, {block, ar_util:encode(Current)},
 			{height, Height}]),
 	ets:delete(node_state, join_state),
-	{noreply, maybe_reset_miner(State)};
+	WeaveSize = B#block.weave_size,
+	case Height == 0 andalso WeaveSize > 0 of
+		true ->
+			%% At genesis with data, register data roots in ar_data_sync and wait
+			%% for sync before starting mining. The genesis block's size_tagged_txs
+			%% is not persisted across serialization, so we must reconstruct it here.
+			SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(B#block.txs, 0),
+			ar_data_sync:add_block(B#block{ size_tagged_txs = SizeTaggedTXs }, SizeTaggedTXs),
+			spawn_genesis_sync_waiter(B, WeaveSize),
+			{noreply, State#{ genesis_sync_pending => true }};
+		false ->
+			{noreply, maybe_reset_miner(State)}
+	end;
+
+handle_info(genesis_data_synced, State) ->
+	?LOG_INFO([{event, genesis_data_synced}, {starting_mining, true}]),
+	{ok, Config} = arweave_config:get_env(),
+	Automine = Config#config.mine,
+	State2 = State#{ genesis_sync_pending => false, automine => Automine },
+	case Automine of
+		true ->
+			%% Spawn a persistent mining restarter that keeps calling start_mining
+			%% until a block is actually mined. This is needed because other processes
+			%% may pause mining shortly after it starts at genesis.
+			spawn(fun() -> genesis_mining_restarter() end),
+			{noreply, State2#{ miner_state => running }};
+		_ ->
+			{noreply, State2}
+	end;
+
+handle_info(force_start_mining, State) ->
+	DiffPair = get_current_diff(),
+	[{_, MerkleRebaseThreshold}] = ets:lookup(node_state,
+			merkle_rebase_support_threshold),
+	[{_, Height}] = ets:lookup(node_state, height),
+	ar_mining_server:start_mining({DiffPair, MerkleRebaseThreshold, Height}),
+	{noreply, State#{ miner_state => running }};
 
 handle_info({event, nonce_limiter, {invalid, H, Code}}, State) ->
 	?LOG_WARNING([{event, received_block_with_invalid_nonce_limiter_chain},
@@ -1479,13 +1516,15 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 	ar_storage:update_block_index(B#block.height, OrphanCount, AddedBIElements),
 	ar_storage:store_reward_history_part(AddedBlocks),
 	ar_storage:store_block_time_history_part(AddedBlocks, ForkRootB),
-	{AdminAddresses2, WalletRoles2, AdminPoolBalance2} =
+	{AdminAddresses2, WalletRoles2, AdminPoolBalance2, ClosedBoards2} =
 		case ar_admin:apply_admin_txs(B#block.txs,
-				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(), ar_admin:get_admin_pool_balance()}) of
+				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(),
+				 ar_admin:get_admin_pool_balance(), ar_admin:get_closed_boards()}) of
 			{ok, State2} ->
 				State2;
 			{error, _} ->
-				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(), ar_admin:get_admin_pool_balance()}
+				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(),
+				 ar_admin:get_admin_pool_balance(), ar_admin:get_closed_boards()}
 		end,
 	ets:insert(node_state, [
 		{recent_block_index,	RecentBI2},
@@ -1514,7 +1553,8 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 		{merkle_rebase_support_threshold, get_merkle_rebase_threshold(B)},
 		{admin_addresses, AdminAddresses2},
 		{wallet_roles, WalletRoles2},
-		{admin_pool_balance, AdminPoolBalance2}
+		{admin_pool_balance, AdminPoolBalance2},
+		{closed_boards, ClosedBoards2}
 	]),
 	SearchSpaceUpperBound = ar_node:get_partition_upper_bound(RecentBI),
 	ar_events:send(node_state, {search_space_upper_bound, SearchSpaceUpperBound}),
@@ -1662,6 +1702,10 @@ maybe_reset_miner(#{ miner_state := MinerState, automine := false } = State) ->
 maybe_reset_miner(State) ->
 	start_mining(State).
 
+start_mining(#{ genesis_sync_pending := true } = State) ->
+	?LOG_INFO([{event, mining_deferred}, {reason, genesis_sync_pending}]),
+	ar:console("Mining deferred: waiting for genesis data sync...~n"),
+	State;
 start_mining(State) ->
 	DiffPair = get_current_diff(),
 	[{_, MerkleRebaseThreshold}] = ets:lookup(node_state,
@@ -1676,6 +1720,171 @@ start_mining(State) ->
 			ar_mining_server:set_merkle_rebase_threshold(MerkleRebaseThreshold),
 			ar_mining_server:set_height(Height),
 			State
+	end.
+
+%% @doc Spawn a process that waits for genesis data to be synced, then triggers
+%% storage module sync and starts mining. This mirrors what the test framework
+%% does in ar_test_node:wait_until_syncs_genesis_data/0.
+spawn_genesis_sync_waiter(B, WeaveSize) ->
+	spawn(fun() ->
+		?LOG_INFO([{event, genesis_sync_waiter_started}, {weave_size, WeaveSize}]),
+		ar:console("Waiting for genesis data to sync (~B bytes)...~n", [WeaveSize]),
+		%% Step 0: Store genesis TX chunk data directly into chunk storage
+		%% and sync record. Genesis TX data is format 1 (inline), so chunks
+		%% must be explicitly stored for SPoRA mining to work.
+		post_genesis_chunks(B),
+		%% Step 1: Wait for genesis data to appear in sync record (any packing).
+		wait_for_sync_record(WeaveSize),
+		?LOG_INFO([{event, genesis_sync_initial_complete}]),
+		ar:console("Genesis data initial sync complete. Triggering storage module sync...~n"),
+		%% Step 2: Cast sync_data to each storage module to trigger cross-module sync,
+		%% same as ar_test_node:wait_until_syncs_genesis_data/0 does.
+		{ok, Config} = arweave_config:get_env(),
+		lists:foreach(
+			fun(M) ->
+				Label = ar_storage_module:label(ar_storage_module:id(M)),
+				gen_server:cast(
+					list_to_atom("ar_data_sync_" ++ Label),
+					sync_data
+				)
+			end,
+			Config#config.storage_modules
+		),
+		%% Step 3: Wait for data to be synced with correct packing.
+		lists:foreach(
+			fun({Size, N, Packing}) ->
+				wait_for_packing_sync(N * Size, (N + 1) * Size, WeaveSize, Packing)
+			end,
+			Config#config.storage_modules
+		),
+		?LOG_INFO([{event, genesis_sync_complete}]),
+		ar:console("Genesis data fully synced. Starting mining.~n"),
+		%% Step 4: Notify node_worker that genesis sync is complete.
+		%% Using '!' (send) instead of gen_server:cast to use handle_info.
+		whereis(?MODULE) ! genesis_data_synced
+	end).
+
+%% @doc Periodically force-start mining until height > 0.
+%% At genesis, other processes may pause mining after it starts.
+%% This restarter keeps re-triggering mining until a block is found.
+genesis_mining_restarter() ->
+	timer:sleep(5000),
+	case ar_node:get_height() of
+		0 ->
+			whereis(?MODULE) ! force_start_mining,
+			genesis_mining_restarter();
+		_ ->
+			ok
+	end.
+
+%% @doc Write genesis block and TX files to disk, mirroring
+%% ar_test_node:write_genesis_files/2.
+write_genesis_files(DataDir, B0) ->
+	BH = B0#block.indep_hash,
+	BlockDir = filename:join(DataDir, ?BLOCK_DIR),
+	ok = filelib:ensure_dir(BlockDir ++ "/"),
+	BlockFilepath = filename:join(BlockDir,
+		binary_to_list(ar_util:encode(BH)) ++ ".bin"),
+	ok = file:write_file(BlockFilepath, ar_serialize:block_to_binary(B0)),
+	TXDir = filename:join(DataDir, ?TX_DIR),
+	ok = filelib:ensure_dir(TXDir ++ "/"),
+	lists:foreach(
+		fun(TX) ->
+			TXID = TX#tx.id,
+			TXFilepath = filename:join(TXDir,
+				binary_to_list(ar_util:encode(TXID)) ++ ".json"),
+			TXJSON = ar_serialize:jsonify(ar_serialize:tx_to_json_struct(TX)),
+			ok = file:write_file(TXFilepath, TXJSON)
+		end,
+		B0#block.txs
+	),
+	?LOG_INFO([{event, wrote_genesis_files}, {data_dir, DataDir}]).
+
+%% @doc Post genesis TX chunk data to the disk pool via add_chunk_to_disk_pool.
+%% This ensures that data_path and tx_path are properly stored, which is required
+%% for constructing valid PoA proofs when a solution is found.
+%% ar_data_sync:add_block must have been called before this function to register
+%% the data root in the data_root_index.
+post_genesis_chunks(B) ->
+	lists:foreach(
+		fun(TX) ->
+			%% Use the TX data directly from the block (not from disk),
+			%% as the disk copy may not include inline data for format 1 TXs.
+			case TX#tx.data of
+				<<>> ->
+					ok;
+				Data when is_binary(Data), byte_size(Data) > 0 ->
+					DataSize = byte_size(Data),
+					Chunks = ar_tx:chunk_binary(?DATA_CHUNK_SIZE, Data),
+					SizedChunks = ar_tx:chunks_to_size_tagged_chunks(Chunks),
+					%% Use chunk IDs (hashes) for tree generation, matching
+					%% ar_tx:generate_chunk_tree/1 which computes data_root.
+					SizedChunkIDs = ar_tx:sized_chunks_to_sized_chunk_ids(SizedChunks),
+					{DataRoot, DataTree} = ar_merkle:generate_tree(SizedChunkIDs),
+					post_chunks_to_disk_pool(SizedChunks, DataTree, DataRoot, DataSize),
+					?LOG_INFO([{event, posted_genesis_chunks},
+						{tx, ar_util:encode(TX#tx.id)},
+						{data_size, DataSize},
+						{chunk_count, length(Chunks)}]);
+				_ ->
+					ok
+			end
+		end,
+		B#block.txs
+	).
+
+post_chunks_to_disk_pool([], _DataTree, _DataRoot, _TXSize) ->
+	ok;
+post_chunks_to_disk_pool([{Chunk, ChunkEnd} | Rest], DataTree, DataRoot, TXSize)
+		when byte_size(Chunk) == 0 ->
+	%% Skip empty padding chunk.
+	post_chunks_to_disk_pool(Rest, DataTree, DataRoot, TXSize);
+post_chunks_to_disk_pool([{Chunk, ChunkEnd} | Rest], DataTree, DataRoot, TXSize) ->
+	%% Use ChunkEnd - 1 for both path generation and disk pool offset,
+	%% matching ar_storage.erl line 708-711.
+	DataPath = ar_merkle:generate_path(DataRoot, ChunkEnd - 1, DataTree),
+	case ar_data_sync:add_chunk_to_disk_pool(DataRoot, DataPath, Chunk, ChunkEnd - 1, TXSize) of
+		ok ->
+			?LOG_INFO([{event, genesis_chunk_added_to_disk_pool}, {offset, ChunkEnd}]);
+		{error, Reason} ->
+			?LOG_WARNING([{event, genesis_chunk_add_failed},
+				{offset, ChunkEnd}, {reason, Reason}])
+	end,
+	post_chunks_to_disk_pool(Rest, DataTree, DataRoot, TXSize).
+
+%% @doc Poll until genesis data appears in the sync record.
+wait_for_sync_record(WeaveSize) ->
+	wait_for_sync_record(0, WeaveSize).
+
+wait_for_sync_record(Offset, WeaveSize) when Offset >= WeaveSize ->
+	ok;
+wait_for_sync_record(Offset, WeaveSize) ->
+	case Offset >= WeaveSize orelse (WeaveSize - Offset < ?DATA_CHUNK_SIZE) of
+		true ->
+			ok;
+		false ->
+			case ar_sync_record:is_recorded(Offset + 1, ar_data_sync) of
+				false ->
+					timer:sleep(1000),
+					wait_for_sync_record(Offset, WeaveSize);
+				_ ->
+					wait_for_sync_record(Offset + ?DATA_CHUNK_SIZE, WeaveSize)
+			end
+	end.
+
+%% @doc Poll until data is synced with the correct packing for a storage module range.
+wait_for_packing_sync(Left, Right, WeaveSize, _Packing)
+		when Left >= Right orelse Left >= WeaveSize
+		orelse (Right - Left < ?DATA_CHUNK_SIZE)
+		orelse (WeaveSize - Left < ?DATA_CHUNK_SIZE) ->
+	ok;
+wait_for_packing_sync(Left, Right, WeaveSize, Packing) ->
+	case ar_sync_record:is_recorded(Left + 1, {ar_data_sync, Packing}) of
+		{{true, _}, _} ->
+			wait_for_packing_sync(Left + ?DATA_CHUNK_SIZE, Right, WeaveSize, Packing);
+		_ ->
+			timer:sleep(1000),
+			wait_for_packing_sync(Left, Right, WeaveSize, Packing)
 	end.
 
 get_current_diff() ->
@@ -1756,6 +1965,10 @@ start_from_state([#block{} = GenesisB]) ->
 	RewardHistory = GenesisB#block.reward_history,
 	BlockTimeHistory = GenesisB#block.block_time_history,
 	BI = [ar_util:block_index_entry_from_block(GenesisB)],
+	%% Write genesis block and TX files to disk so they can be read later.
+	%% This mirrors what ar_test_node:write_genesis_files/2 does in tests.
+	{ok, Config} = arweave_config:get_env(),
+	write_genesis_files(Config#config.data_dir, GenesisB),
 	self() ! {join_from_state, 0, BI, [GenesisB#block{
 		reward_history = RewardHistory,
 		block_time_history = BlockTimeHistory
