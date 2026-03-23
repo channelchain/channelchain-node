@@ -642,27 +642,34 @@ validate_block(merkle_rebase_support_threshold, {NewB, OldB}) ->
 is_wallet_invalid(#tx{ signature = <<>> }, _Wallets) ->
 	false;
 is_wallet_invalid(TX, Wallets) ->
-	OwnerAddress = ar_tx:get_owner_address(TX),
-	case maps:get(OwnerAddress, Wallets, not_found) of
-		{Balance, LastTX} when Balance >= 0 ->
-			case Balance of
-				0 ->
-					byte_size(LastTX) == 0;
-				_ ->
-					false
-			end;
-		{Balance, LastTX, _Denomination, _MiningPermission} when Balance >= 0 ->
-			case Balance of
-				0 ->
-					byte_size(LastTX) == 0;
-				_ ->
-					false
-			end;
-		_ ->
-			true
+	case ar_admin:is_admin_tx(TX) of
+		true ->
+			false;
+		false ->
+			case ar_admin:is_channelchain_tx(TX) andalso TX#tx.quantity =:= 0 of
+				true ->
+					%% Fee-free ChannelChain TXs (posts etc.) with no transfer.
+					false;
+				false ->
+					is_wallet_invalid2(TX, Wallets)
+			end
 	end.
 -else.
 is_wallet_invalid(TX, Wallets) ->
+	case ar_admin:is_admin_tx(TX) of
+		true ->
+			false;
+		false ->
+			case ar_admin:is_channelchain_tx(TX) andalso TX#tx.quantity =:= 0 of
+				true ->
+					false;
+				false ->
+					is_wallet_invalid2(TX, Wallets)
+			end
+	end.
+-endif.
+
+is_wallet_invalid2(TX, Wallets) ->
 	OwnerAddress = ar_tx:get_owner_address(TX),
 	case maps:get(OwnerAddress, Wallets, not_found) of
 		{Balance, LastTX} when Balance >= 0 ->
@@ -682,7 +689,6 @@ is_wallet_invalid(TX, Wallets) ->
 		_ ->
 			true
 	end.
--endif.
 
 %%%===================================================================
 %%% Tests.

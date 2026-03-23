@@ -625,6 +625,12 @@ verify_signature_v2(TX, verify_signature, Height) ->
 validate_overspend(TX, Accounts) ->
 	case ar_admin:is_admin_tx(TX) of
 		true ->
+			%% Admin TXs spend from admin pool, not wallets.
+			true;
+		false ->
+	case ar_admin:is_channelchain_tx(TX) andalso TX#tx.quantity =:= 0 of
+		true ->
+			%% Fee-free ChannelChain TXs (posts etc.) with no transfer.
 			true;
 		false ->
 	From = get_owner_address(TX),
@@ -653,6 +659,7 @@ validate_overspend(TX, Accounts) ->
 		end,
 		Addresses
 	)
+	end
 	end.
 
 is_tx_fee_sufficient(Args) ->

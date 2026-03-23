@@ -50,8 +50,20 @@ get_info() ->
         <<"wallet_roles">> => WalletRoles,
         <<"wallet_capabilities">> => WalletCapabilities,
         <<"closed_boards">> => ClosedBoards,
+        <<"board_moderators">> => format_board_moderators(ar_admin:get_board_moderators()),
+        <<"user_capabilities">> => format_user_capabilities(ar_admin:get_user_capabilities()),
         <<"pow_difficulty">> => ar_pow_verify:get_current_difficulty()
     }.
+
+format_board_moderators(BM) ->
+	maps:fold(fun(Addr, Boards, Acc) ->
+		Acc#{ format_admin_address(Addr) => Boards }
+	end, #{}, BM).
+
+format_user_capabilities(UC) ->
+	maps:fold(fun(Addr, Caps, Acc) ->
+		Acc#{ format_admin_address(Addr) => Caps }
+	end, #{}, UC).
 
 format_admin_address(Addr) when is_binary(Addr), byte_size(Addr) == 32 ->
 	ar_util:encode(Addr);

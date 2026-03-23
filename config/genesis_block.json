@@ -18,6 +18,12 @@
     "board_close_cost": 100000,
     "admin_pool_donation_enabled": true
   },
+  "wallets": [
+    {
+      "address": "b3fSq45qUwZgsrejjrwWqAiOyKysM7gJeGOG534CHtg",
+      "balance": 10000000000000
+    }
+  ],
   "block_time_target_seconds": 120,
   "max_tx_data_size": 10240,
   "allowed_content_types": ["application/json", "text/plain"],

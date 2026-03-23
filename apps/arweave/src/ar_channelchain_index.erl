@@ -21,6 +21,7 @@
 -define(TX_TAGS_TABLE, channelchain_tx_tags).
 -define(TX_INDEX_TABLE, channelchain_tx_index).
 -define(DELETED_TXS_TABLE, channelchain_deleted_txs).
+-define(TX_RECORDS_TABLE, channelchain_tx_records).  %% Full TX records for admin TXs
 -define(APP_NAME, <<"ChannelChain">>).
 
 %%%===================================================================
@@ -62,6 +63,8 @@ init([]) ->
     ets:new(?TX_INDEX_TABLE,
         [bag, public, named_table, {read_concurrency, true}]),
     ets:new(?DELETED_TXS_TABLE,
+        [set, public, named_table, {read_concurrency, true}]),
+    ets:new(?TX_RECORDS_TABLE,
         [set, public, named_table, {read_concurrency, true}]),
     %% Subscribe to tx events (new TX received by node)
     ar_events:subscribe(tx),
@@ -149,23 +152,27 @@ maybe_index_tx(TX) when is_record(TX, tx) ->
             Type = get_tag_value(Tags, <<"Type">>),
             
             %% If it's a deletion TX, mark the target as deleted
-            case Type of
-                <<"Admin-Delete">> ->
+            IsDeleteType = (Type =:= <<"Admin-Delete">> orelse
+                           Type =:= <<"Moderator-Hide">> orelse
+                           Type =:= <<"Board-Moderator-Hide">> orelse
+                           Type =:= <<"Self-Delete">>),
+            case IsDeleteType of
+                true ->
                     case get_tag_value(Tags, <<"Target-TX">>) of
                         undefined -> ok;
                         TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
                     end;
-                <<"Moderator-Hide">> ->
-                    case get_tag_value(Tags, <<"Target-TX">>) of
-                        undefined -> ok;
-                        TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
-                    end;
-                _ ->
+                false ->
                     ok
             end,
 
             %% Store {txid, tags}
             ets:insert(?TX_TAGS_TABLE, {TXID, Tags}),
+            %% Store full TX record for privileged TXs (needed by ar_admin state rebuild)
+            case ar_admin:is_admin_tx(TX) of
+                true -> ets:insert(?TX_RECORDS_TABLE, {TXID, TX});
+                false -> ok
+            end,
             %% Build inverted index: {TagName, TagValue, TXID}
             lists:foreach(fun({Name, Value}) ->
                 ets:insert(?TX_INDEX_TABLE, {{Name, Value}, TXID})
@@ -244,7 +251,12 @@ do_query(Filters) ->
                 txids_for_tag(<<"Type">>, <<"Admin-Revoke">>) ++
                 txids_for_tag(<<"Type">>, <<"Admin-Board-Close">>) ++
                 txids_for_tag(<<"Type">>, <<"Moderator-Hide">>) ++
-                txids_for_tag(<<"Type">>, <<"Moderator-Ban">>)
+                txids_for_tag(<<"Type">>, <<"Moderator-Ban">>) ++
+                txids_for_tag(<<"Type">>, <<"Board-Moderator-Hide">>) ++
+                txids_for_tag(<<"Type">>, <<"Board-Moderator-Ban">>) ++
+                txids_for_tag(<<"Type">>, <<"User-Grant">>) ++
+                txids_for_tag(<<"Type">>, <<"User-Revoke">>) ++
+                txids_for_tag(<<"Type">>, <<"Self-Delete">>)
             );
         <<"Moderator-Op">> ->
             lists:usort(

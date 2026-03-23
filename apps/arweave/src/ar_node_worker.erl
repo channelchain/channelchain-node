@@ -129,7 +129,10 @@ init([]) ->
 			Config2 = Config#config{ init = false },
 			arweave_config:set_env(Config2),
 			InitialBalance = ?AR(?LOCALNET_BALANCE),
-			[B0] = ar_weave:init([{Config#config.mining_addr, InitialBalance, <<>>}],
+			MinerWallet = [{Config#config.mining_addr, InitialBalance, <<>>}],
+			GenesisWallets = ar_admin:get_genesis_wallets(),
+			AllWallets = MinerWallet ++ GenesisWallets,
+			[B0] = ar_weave:init(AllWallets,
 					ar_retarget:switch_to_linear_diff(Config#config.diff)),
 			RootHash0 = B0#block.wallet_list,
 			RootHash0 = ar_storage:write_wallet_list(0, B0#block.account_tree),
@@ -1516,15 +1519,16 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 	ar_storage:update_block_index(B#block.height, OrphanCount, AddedBIElements),
 	ar_storage:store_reward_history_part(AddedBlocks),
 	ar_storage:store_block_time_history_part(AddedBlocks, ForkRootB),
-	{AdminAddresses2, WalletRoles2, AdminPoolBalance2, ClosedBoards2} =
-		case ar_admin:apply_admin_txs(B#block.txs,
-				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(),
-				 ar_admin:get_admin_pool_balance(), ar_admin:get_closed_boards()}) of
+	CurrentAdminState = {ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(),
+		ar_admin:get_admin_pool_balance(), ar_admin:get_closed_boards(),
+		ar_admin:get_board_moderators(), ar_admin:get_user_capabilities()},
+	{AdminAddresses2, WalletRoles2, AdminPoolBalance2, ClosedBoards2,
+	 BoardModerators2, UserCapabilities2} =
+		case ar_admin:apply_admin_txs(B#block.txs, CurrentAdminState) of
 			{ok, State2} ->
 				State2;
 			{error, _} ->
-				{ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(),
-				 ar_admin:get_admin_pool_balance(), ar_admin:get_closed_boards()}
+				CurrentAdminState
 		end,
 	ets:insert(node_state, [
 		{recent_block_index,	RecentBI2},
@@ -1554,7 +1558,9 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 		{admin_addresses, AdminAddresses2},
 		{wallet_roles, WalletRoles2},
 		{admin_pool_balance, AdminPoolBalance2},
-		{closed_boards, ClosedBoards2}
+		{closed_boards, ClosedBoards2},
+		{board_moderators, BoardModerators2},
+		{user_capabilities, UserCapabilities2}
 	]),
 	SearchSpaceUpperBound = ar_node:get_partition_upper_bound(RecentBI),
 	ar_events:send(node_state, {search_space_upper_bound, SearchSpaceUpperBound}),

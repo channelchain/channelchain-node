@@ -80,7 +80,7 @@
 -define(ECDSA_SIG_SIZE, 65).
 
 %% The difficulty a new weave is started with.
--define(DEFAULT_DIFF, 1).
+-define(DEFAULT_DIFF, 4).
 
 -ifndef(TARGET_BLOCK_TIME).
 -define(TARGET_BLOCK_TIME, 120).
