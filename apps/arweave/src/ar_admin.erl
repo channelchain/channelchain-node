@@ -59,9 +59,12 @@
 -define(CAP_EDIT_POST, <<"can_edit_post">>).
 -define(CAP_VERIFIED_POST, <<"can_verified_post">>).
 -define(CAP_PRIORITY_REPORT, <<"can_priority_report">>).
+-define(CAP_STICKY_POST, <<"can_sticky_post">>).
+-define(CAP_BYPASS_COOLDOWN, <<"can_bypass_cooldown">>).
 
 -define(VALID_USER_CAPS, [?CAP_SELF_DELETE_POST, ?CAP_EDIT_POST,
-	?CAP_VERIFIED_POST, ?CAP_PRIORITY_REPORT]).
+	?CAP_VERIFIED_POST, ?CAP_PRIORITY_REPORT,
+	?CAP_STICKY_POST, ?CAP_BYPASS_COOLDOWN]).
 
 %%%===================================================================
 %%% State: 6-tuple
@@ -110,9 +113,17 @@ validate_capabilities(<<"Edit-Post">>, TX, OwnerAddr, _AA, _WR, _BM, UserCaps) -
 	lists:member(?CAP_EDIT_POST, Caps)
 		andalso validate_edit_target(TX, OwnerAddr);
 validate_capabilities(<<"Priority-Report">>, _TX, OwnerAddr, _AA, _WR, _BM, UserCaps) ->
-	%% Priority-Report: owner must have can_priority_report capability.
 	Caps = maps:get(OwnerAddr, UserCaps, []),
 	lists:member(?CAP_PRIORITY_REPORT, Caps);
+validate_capabilities(<<"Verified-Post">>, _TX, OwnerAddr, _AA, _WR, _BM, UserCaps) ->
+	Caps = maps:get(OwnerAddr, UserCaps, []),
+	lists:member(?CAP_VERIFIED_POST, Caps);
+validate_capabilities(<<"Sticky-Post">>, _TX, OwnerAddr, _AA, _WR, _BM, UserCaps) ->
+	Caps = maps:get(OwnerAddr, UserCaps, []),
+	lists:member(?CAP_STICKY_POST, Caps);
+validate_capabilities(<<"Cooldown-Bypass-Post">>, _TX, OwnerAddr, _AA, _WR, _BM, UserCaps) ->
+	Caps = maps:get(OwnerAddr, UserCaps, []),
+	lists:member(?CAP_BYPASS_COOLDOWN, Caps);
 validate_capabilities(Type, TX, OwnerAddr, AdminAddresses, WalletRoles, BoardMods, _UserCaps) ->
 	Capabilities = get_capabilities_for_address(OwnerAddr, AdminAddresses, WalletRoles),
 	case required_capability(Type) of
@@ -202,6 +213,9 @@ get_admin_cost(<<"User-Revoke">>) -> ?USER_REVOKE_COST;
 get_admin_cost(<<"Self-Delete">>) -> 0; %% paid by user wallet via TX quantity
 get_admin_cost(<<"Edit-Post">>) -> 0; %% paid by user wallet via TX quantity
 get_admin_cost(<<"Priority-Report">>) -> 0; %% paid by user wallet via TX quantity
+get_admin_cost(<<"Verified-Post">>) -> 0; %% paid by user wallet via TX quantity
+get_admin_cost(<<"Sticky-Post">>) -> 0; %% paid by user wallet via TX quantity
+get_admin_cost(<<"Cooldown-Bypass-Post">>) -> 0; %% paid by user wallet via TX quantity
 get_admin_cost(_) -> 0.
 
 %% ── State application ──
@@ -333,6 +347,9 @@ is_privileged_type(<<"User-Revoke">>) -> true;
 is_privileged_type(<<"Self-Delete">>) -> true;
 is_privileged_type(<<"Edit-Post">>) -> true;
 is_privileged_type(<<"Priority-Report">>) -> true;
+is_privileged_type(<<"Verified-Post">>) -> true;
+is_privileged_type(<<"Sticky-Post">>) -> true;
+is_privileged_type(<<"Cooldown-Bypass-Post">>) -> true;
 is_privileged_type(_) -> false.
 
 required_capability(<<"Admin-Delete">>) -> ?CAP_HIDE_POST;
@@ -349,6 +366,9 @@ required_capability(<<"User-Revoke">>) -> ?CAP_MANAGE_ROLES;
 required_capability(<<"Self-Delete">>) -> undefined; %% handled separately
 required_capability(<<"Edit-Post">>) -> undefined; %% handled separately
 required_capability(<<"Priority-Report">>) -> undefined; %% handled separately
+required_capability(<<"Verified-Post">>) -> undefined; %% handled separately
+required_capability(<<"Sticky-Post">>) -> undefined; %% handled separately
+required_capability(<<"Cooldown-Bypass-Post">>) -> undefined; %% handled separately
 required_capability(_) -> undefined.
 
 %% ── Payload validation ──
@@ -387,6 +407,12 @@ has_valid_privileged_payload(TX, <<"Edit-Post">>) ->
 	has_nonempty_tag(TX, <<"Target-TX">>);
 has_valid_privileged_payload(TX, <<"Priority-Report">>) ->
 	has_nonempty_tag(TX, <<"Target-TX">>) andalso has_nonempty_tag(TX, <<"Reason">>);
+has_valid_privileged_payload(TX, <<"Verified-Post">>) ->
+	has_nonempty_tag(TX, <<"Board-Id">>);
+has_valid_privileged_payload(TX, <<"Sticky-Post">>) ->
+	has_nonempty_tag(TX, <<"Target-TX">>) andalso has_nonempty_tag(TX, <<"Board-Id">>);
+has_valid_privileged_payload(TX, <<"Cooldown-Bypass-Post">>) ->
+	has_nonempty_tag(TX, <<"Board-Id">>);
 has_valid_privileged_payload(_TX, _Type) ->
 	true.
 
