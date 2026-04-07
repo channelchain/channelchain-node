@@ -119,7 +119,7 @@ handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
 handle_cast({add_tx, TX}, State) ->
-    maybe_index_tx(TX),
+    maybe_index_tx(TX, unconfirmed),
     {noreply, State};
 
 handle_cast(build_index, State) ->
@@ -132,21 +132,21 @@ handle_cast(build_index, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-%% Handle ar_events for new TXs
+%% Handle ar_events for new TXs (unconfirmed — no rewrite/delete effects)
 handle_info({event, tx, {new, TX, _Source}}, State) ->
-    maybe_index_tx(TX),
+    maybe_index_tx(TX, unconfirmed),
     {noreply, State};
 
 handle_info({event, tx, {ready_for_mining, TX}}, State) ->
-    maybe_index_tx(TX),
+    maybe_index_tx(TX, unconfirmed),
     {noreply, State};
 
-%% When a block is applied, index its confirmed TXs
+%% When a block is applied, index its confirmed TXs (with rewrite/delete effects)
 handle_info({event, block, {new, B, _Source}}, State) ->
     lists:foreach(fun(TXID) ->
         case ar_storage:read_tx(TXID) of
             unavailable -> ok;
-            TX -> maybe_index_tx(TX)
+            TX -> maybe_index_tx(TX, confirmed)
         end
     end, B#block.txs),
     {noreply, State};
@@ -169,38 +169,44 @@ terminate(_Reason, _State) ->
 %%%===================================================================
 
 %% @doc Index a TX if it belongs to the ChannelChain app.
-maybe_index_tx(TX) when is_record(TX, tx) ->
+%% Status: confirmed | unconfirmed. Deletion/rewrite effects only apply when confirmed.
+maybe_index_tx(TX, Status) when is_record(TX, tx) ->
     Tags = TX#tx.tags,
     case get_tag_value(Tags, <<"App-Name">>) of
         ?APP_NAME ->
             TXID = TX#tx.id,
             Type = get_tag_value(Tags, <<"Type">>),
-            
-            %% If it's a deletion TX, mark the target as deleted
-            IsDeleteType = (Type =:= <<"Admin-Delete">> orelse
-                           Type =:= <<"Moderator-Hide">> orelse
-                           Type =:= <<"Board-Moderator-Hide">> orelse
-                           Type =:= <<"Self-Delete">>),
-            case IsDeleteType of
-                true ->
-                    case get_tag_value(Tags, <<"Target-TX">>) of
-                        undefined -> ok;
-                        TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
-                    end;
-                false ->
-                    ok
-            end,
 
-            %% If it's a rewrite commit TX, map old TX → replacement TX
-            case Type of
-                <<"Admin-Rewrite-Commit">> ->
-                    OldTxId = get_tag_value(Tags, <<"Target-TX">>),
-                    NewTxId = get_tag_value(Tags, <<"Replacement-TX">>),
-                    case OldTxId =/= undefined andalso NewTxId =/= undefined of
-                        true -> ets:insert(?REWRITTEN_TXS_TABLE, {OldTxId, NewTxId});
-                        false -> ok
+            %% Deletion and rewrite effects only on confirmed TXs
+            case Status of
+                confirmed ->
+                    %% If it's a deletion TX, mark the target as deleted
+                    IsDeleteType = (Type =:= <<"Admin-Delete">> orelse
+                                   Type =:= <<"Moderator-Hide">> orelse
+                                   Type =:= <<"Board-Moderator-Hide">> orelse
+                                   Type =:= <<"Self-Delete">>),
+                    case IsDeleteType of
+                        true ->
+                            case get_tag_value(Tags, <<"Target-TX">>) of
+                                undefined -> ok;
+                                TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
+                            end;
+                        false ->
+                            ok
+                    end,
+                    %% If it's a rewrite commit TX, map old TX → replacement TX
+                    case Type of
+                        <<"Admin-Rewrite-Commit">> ->
+                            OldTxId = get_tag_value(Tags, <<"Target-TX">>),
+                            NewTxId = get_tag_value(Tags, <<"Replacement-TX">>),
+                            case OldTxId =/= undefined andalso NewTxId =/= undefined of
+                                true -> ets:insert(?REWRITTEN_TXS_TABLE, {OldTxId, NewTxId});
+                                false -> ok
+                            end;
+                        _ ->
+                            ok
                     end;
-                _ ->
+                unconfirmed ->
                     ok
             end,
 
@@ -218,7 +224,7 @@ maybe_index_tx(TX) when is_record(TX, tx) ->
         _ ->
             ok
     end;
-maybe_index_tx(_) ->
+maybe_index_tx(_, _) ->
     ok.
 
 %% @doc Remove a TX from the index.
@@ -267,7 +273,7 @@ build_from_mempool() ->
     lists:foreach(fun(TXID) ->
         case ar_mempool:get_tx(TXID) of
             not_found -> ok;
-            TX -> maybe_index_tx(TX)
+            TX -> maybe_index_tx(TX, unconfirmed)
         end
     end, PendingTXIDs).
 
@@ -285,7 +291,7 @@ build_from_chain() ->
                             lists:foreach(fun(TXID) ->
                                 case ar_storage:read_tx(TXID) of
                                     unavailable -> ok;
-                                    TX -> maybe_index_tx(TX)
+                                    TX -> maybe_index_tx(TX, confirmed)
                                 end
                             end, TXs)
                     end

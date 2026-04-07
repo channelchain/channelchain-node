@@ -785,6 +785,9 @@ validate_replacement_tx(ReplacementTxId, Proposal) ->
 
 %% @doc Check if a target TX is within the rewrite depth limit.
 %% Returns ok | too_deep | not_confirmed.
+%% Note: ar_node:get_height() returns the height of the last applied block,
+%% not the block currently being processed. This means the depth check is
+%% off by at most 1 block in the permissive direction (safe side).
 check_rewrite_depth(TargetTxId) ->
 	case catch ar_storage:get_tx_confirmation_data(TargetTxId) of
 		{ok, {TargetHeight, _BlockHash}} ->
