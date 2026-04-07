@@ -1521,9 +1521,12 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 	ar_storage:store_block_time_history_part(AddedBlocks, ForkRootB),
 	CurrentAdminState = {ar_admin:get_admin_addresses(), ar_admin:get_wallet_roles(),
 		ar_admin:get_admin_pool_balance(), ar_admin:get_closed_boards(),
-		ar_admin:get_board_moderators(), ar_admin:get_user_capabilities()},
+		ar_admin:get_board_moderators(), ar_admin:get_user_capabilities(),
+		ar_admin:get_rewrite_proposals(), ar_admin:get_rewrite_approvals(),
+		ar_admin:get_rewritten_txs(), ar_admin:get_rewrite_reverse()},
 	{AdminAddresses2, WalletRoles2, AdminPoolBalance2, ClosedBoards2,
-	 BoardModerators2, UserCapabilities2} =
+	 BoardModerators2, UserCapabilities2,
+	 RewriteProposals2, RewriteApprovals2, RewrittenTxs2, RewriteReverse2} =
 		case ar_admin:apply_admin_txs(B#block.txs, CurrentAdminState) of
 			{ok, State2} ->
 				State2;
@@ -1560,7 +1563,11 @@ apply_validated_block2(State, B, PrevBlocks, Orphans, RecentBI, BlockTXPairs) ->
 		{admin_pool_balance, AdminPoolBalance2},
 		{closed_boards, ClosedBoards2},
 		{board_moderators, BoardModerators2},
-		{user_capabilities, UserCapabilities2}
+		{user_capabilities, UserCapabilities2},
+		{rewrite_proposals, RewriteProposals2},
+		{rewrite_approvals, RewriteApprovals2},
+		{rewritten_txs, RewrittenTxs2},
+		{rewrite_reverse, RewriteReverse2}
 	]),
 	SearchSpaceUpperBound = ar_node:get_partition_upper_bound(RecentBI),
 	ar_events:send(node_state, {search_space_upper_bound, SearchSpaceUpperBound}),

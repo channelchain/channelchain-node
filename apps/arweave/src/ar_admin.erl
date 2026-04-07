@@ -2,6 +2,7 @@
 %%
 %% 権限付きTXの権限検証、および Admin Pool / ロール / Capability 状態管理
 %% capability_plan.md に基づく拡張権限体系
+%% TX置換(rewrite)プロトコル対応
 
 -module(ar_admin).
 
@@ -20,7 +21,13 @@
 	get_closed_boards/0,
 	get_board_moderators/0,
 	get_user_capabilities/0,
+	get_rewrite_proposals/0,
+	get_rewrite_approvals/0,
+	get_rewritten_txs/0,
+	get_rewrite_reverse/0,
 	is_board_closed/1,
+	is_rewritten/1,
+	get_replacement_tx/1,
 	initial_state_entries/0,
 	current_state_entries/0,
 	refresh_state/0,
@@ -44,6 +51,9 @@
 -define(SELF_DELETE_COST,          200000000).     %% 0.0002 TOKEN
 -define(DEFAULT_GENESIS_CONFIG_PATH, "config/genesis_block.json").
 
+%% ── Rewrite ──
+-define(MAX_REWRITE_DEPTH, 20).
+
 %% ── Roles ──
 -define(ROLE_ADMIN, <<"admin">>).
 -define(ROLE_MODERATOR, <<"moderator">>).
@@ -53,6 +63,7 @@
 -define(CAP_HIDE_POST, <<"can_hide_post">>).
 -define(CAP_BAN_USER, <<"can_ban_user">>).
 -define(CAP_MANAGE_ROLES, <<"can_manage_roles">>).
+-define(CAP_REWRITE_CONTENT, <<"can_rewrite_content">>).
 
 %% ── User Capabilities ──
 -define(CAP_SELF_DELETE_POST, <<"can_self_delete_post">>).
@@ -67,12 +78,17 @@
 	?CAP_STICKY_POST, ?CAP_BYPASS_COOLDOWN]).
 
 %%%===================================================================
-%%% State: 6-tuple
+%%% State: 10-tuple
 %%% {AdminAddresses, WalletRoles, AdminPoolBalance, ClosedBoards,
-%%%  BoardModerators, UserCapabilities}
+%%%  BoardModerators, UserCapabilities,
+%%%  RewriteProposals, RewriteApprovals, RewrittenTxs, RewriteReverse}
 %%%
 %%% BoardModerators: #{WalletAddress => [BoardId]}
 %%% UserCapabilities: #{WalletAddress => [Capability]}
+%%% RewriteProposals: #{ProposalTxId => #{target_txid, target_type, ...}}
+%%% RewriteApprovals: #{ProposalTxId => [AdminAddress]} (reserved for future)
+%%% RewrittenTxs: #{OldTxId => NewTxId}
+%%% RewriteReverse: #{NewTxId => OldTxId}
 %%%===================================================================
 
 validate_admin_tx(TX) ->
@@ -84,7 +100,8 @@ is_admin_tx(TX) ->
 is_channelchain_tx(TX) ->
 	get_tag(TX, <<"App-Name">>) =:= <<"ChannelChain">>.
 
-validate_admin_tx(TX, {AdminAddresses, WalletRoles, _Balance, _Boards, BoardMods, UserCaps}) ->
+validate_admin_tx(TX, {AdminAddresses, WalletRoles, _Balance, _Boards, BoardMods, UserCaps,
+                       _RP, _RA, _RT, _RR}) ->
 	Type = get_tag(TX, <<"Type">>),
 	case is_privileged_type(Type) of
 		false ->
@@ -216,6 +233,9 @@ get_admin_cost(<<"Priority-Report">>) -> 0; %% paid by user wallet via TX quanti
 get_admin_cost(<<"Verified-Post">>) -> 0; %% paid by user wallet via TX quantity
 get_admin_cost(<<"Sticky-Post">>) -> 0; %% paid by user wallet via TX quantity
 get_admin_cost(<<"Cooldown-Bypass-Post">>) -> 0; %% paid by user wallet via TX quantity
+get_admin_cost(<<"Board">>) -> 0; %% board creation is free for admin
+get_admin_cost(<<"Admin-Rewrite-Propose">>) -> 0;
+get_admin_cost(<<"Admin-Rewrite-Commit">>) -> 0;
 get_admin_cost(_) -> 0.
 
 %% ── State application ──
@@ -229,97 +249,97 @@ apply_admin_txs(TXs, State) ->
 		TXs2
 	).
 
-apply_admin_tx(TX, {AA, WR, Balance, Boards, BM, UC}) ->
+apply_admin_tx(TX, {AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}) ->
 	Type = get_tag(TX, <<"Type">>),
 	case is_privileged_type(Type) of
 		false ->
-			{ok, {AA, WR, Balance, Boards, BM, UC}};
+			{ok, {AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}};
 		true ->
-			case validate_admin_tx(TX, {AA, WR, Balance, Boards, BM, UC}) of
+			case validate_admin_tx(TX, {AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}) of
 				false ->
 					%% Skip unauthorized TXs instead of aborting the fold
-					{ok, {AA, WR, Balance, Boards, BM, UC}};
+					{ok, {AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}};
 				true ->
 					Cost = get_admin_cost(Type),
 					case Balance >= Cost of
 						false ->
 							%% Skip underfunded TXs
-							{ok, {AA, WR, Balance, Boards, BM, UC}};
+							{ok, {AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}};
 						true ->
-							{ok, apply_admin_effect(Type, TX, AA, WR, Balance - Cost, Boards, BM, UC)}
+							{ok, apply_admin_effect(Type, TX, AA, WR, Balance - Cost, Boards, BM, UC, RP, RA, RT, RR)}
 					end
 			end
 	end.
 
 %% ── Effects ──
-apply_admin_effect(<<"Admin-Grant">>, TX, AA, WR, Balance, Boards, BM, UC) ->
+apply_admin_effect(<<"Admin-Grant">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
 	case {get_target_address(TX), get_grant_role(TX)} of
 		{undefined, _} ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{_, undefined} ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{TargetAddress, ?ROLE_ADMIN} ->
 			{lists:usort([TargetAddress | AA]),
 			 WR#{ TargetAddress => ?ROLE_ADMIN },
-			 Balance, Boards, BM, UC};
+			 Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{TargetAddress, ?ROLE_MODERATOR} ->
 			{lists:delete(TargetAddress, AA),
 			 WR#{ TargetAddress => ?ROLE_MODERATOR },
-			 Balance, Boards, BM, UC};
+			 Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{TargetAddress, ?ROLE_BOARD_MODERATOR} ->
 			BoardId = get_tag(TX, <<"Board-Id">>),
 			case BoardId of
 				undefined ->
-					{AA, WR, Balance, Boards, BM, UC};
+					{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 				_ ->
 					BM2 = maps:update_with(TargetAddress,
 						fun(Bs) -> lists:usort([BoardId | Bs]) end,
 						[BoardId], BM),
 					{AA, WR#{ TargetAddress => ?ROLE_BOARD_MODERATOR },
-					 Balance, Boards, BM2, UC}
+					 Balance, Boards, BM2, UC, RP, RA, RT, RR}
 			end
 	end;
-apply_admin_effect(<<"Admin-Revoke">>, TX, AA, WR, Balance, Boards, BM, UC) ->
+apply_admin_effect(<<"Admin-Revoke">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
 	case get_target_address(TX) of
 		undefined ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		TargetAddress ->
 			{lists:delete(TargetAddress, AA),
 			 maps:remove(TargetAddress, WR),
 			 Balance, Boards,
 			 maps:remove(TargetAddress, BM),
-			 UC}
+			 UC, RP, RA, RT, RR}
 	end;
-apply_admin_effect(<<"Admin-Board-Close">>, TX, AA, WR, Balance, Boards, BM, UC) ->
+apply_admin_effect(<<"Admin-Board-Close">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
 	case get_tag(TX, <<"Board-Id">>) of
 		undefined ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		BoardId ->
-			{AA, WR, Balance, lists:usort([BoardId | Boards]), BM, UC}
+			{AA, WR, Balance, lists:usort([BoardId | Boards]), BM, UC, RP, RA, RT, RR}
 	end;
-apply_admin_effect(<<"User-Grant">>, TX, AA, WR, Balance, Boards, BM, UC) ->
+apply_admin_effect(<<"User-Grant">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
 	case {get_target_address(TX), get_tag(TX, <<"Capability">>)} of
 		{undefined, _} ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{_, undefined} ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{TargetAddress, Cap} ->
 			case lists:member(Cap, ?VALID_USER_CAPS) of
 				false ->
-					{AA, WR, Balance, Boards, BM, UC};
+					{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 				true ->
 					UC2 = maps:update_with(TargetAddress,
 						fun(Cs) -> lists:usort([Cap | Cs]) end,
 						[Cap], UC),
-					{AA, WR, Balance, Boards, BM, UC2}
+					{AA, WR, Balance, Boards, BM, UC2, RP, RA, RT, RR}
 			end
 	end;
-apply_admin_effect(<<"User-Revoke">>, TX, AA, WR, Balance, Boards, BM, UC) ->
+apply_admin_effect(<<"User-Revoke">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
 	case {get_target_address(TX), get_tag(TX, <<"Capability">>)} of
 		{undefined, _} ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{_, undefined} ->
-			{AA, WR, Balance, Boards, BM, UC};
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 		{TargetAddress, Cap} ->
 			CurrentCaps = maps:get(TargetAddress, UC, []),
 			NewCaps = lists:delete(Cap, CurrentCaps),
@@ -327,10 +347,82 @@ apply_admin_effect(<<"User-Revoke">>, TX, AA, WR, Balance, Boards, BM, UC) ->
 				[] -> maps:remove(TargetAddress, UC);
 				_ -> UC#{ TargetAddress => NewCaps }
 			end,
-			{AA, WR, Balance, Boards, BM, UC2}
+			{AA, WR, Balance, Boards, BM, UC2, RP, RA, RT, RR}
 	end;
-apply_admin_effect(_, _TX, AA, WR, Balance, Boards, BM, UC) ->
-	{AA, WR, Balance, Boards, BM, UC}.
+apply_admin_effect(<<"Admin-Rewrite-Propose">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
+	ProposalTxId = TX#tx.id,
+	TargetTxId = get_tag(TX, <<"Target-TX">>),
+	TargetType = get_tag(TX, <<"Target-Type">>),
+	BoardId = get_tag(TX, <<"Board-Id">>),
+	ThreadId = get_tag(TX, <<"Thread-Id">>),
+	ReplacementHash = get_tag(TX, <<"Replacement-Hash">>),
+	Reason = get_tag(TX, <<"Reason">>),
+	RequestedBy = ar_tx:get_owner_address(TX),
+	%% Only Post rewrite is supported in Alpha
+	case TargetType of
+		<<"Post">> ->
+			%% Check target is not already rewritten (no multi-rewrite)
+			case maps:is_key(TargetTxId, RT) of
+				true ->
+					{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+				false ->
+					Proposal = #{
+						target_txid => TargetTxId,
+						target_type => TargetType,
+						board_id => BoardId,
+						thread_id => ThreadId,
+						replacement_hash => ReplacementHash,
+						reason => Reason,
+						requested_by => RequestedBy,
+						committed => false
+					},
+					RP2 = RP#{ ProposalTxId => Proposal },
+					{AA, WR, Balance, Boards, BM, UC, RP2, RA, RT, RR}
+			end;
+		_ ->
+			%% Unsupported target type
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}
+	end;
+apply_admin_effect(<<"Admin-Rewrite-Commit">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
+	ProposalTxId = get_tag(TX, <<"Proposal-TX">>),
+	TargetTxId = get_tag(TX, <<"Target-TX">>),
+	ReplacementTxId = get_tag(TX, <<"Replacement-TX">>),
+	case maps:get(ProposalTxId, RP, undefined) of
+		undefined ->
+			%% Proposal does not exist
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+		Proposal ->
+			AlreadyCommitted = maps:get(committed, Proposal, false),
+			ProposalTarget = maps:get(target_txid, Proposal),
+			TargetAlreadyRewritten = maps:is_key(TargetTxId, RT),
+			ReplacementIsTarget = maps:is_key(ReplacementTxId, RT),
+			ReplacementIsReplacement = maps:is_key(ReplacementTxId, RR),
+			case AlreadyCommitted orelse
+			     ProposalTarget =/= TargetTxId orelse
+			     TargetAlreadyRewritten orelse
+			     ReplacementIsTarget orelse
+			     ReplacementIsReplacement of
+				true ->
+					%% Invalid commit: already committed, target mismatch,
+					%% multi-rewrite, or replacement already used
+					{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+				false ->
+					%% Depth check: target TX must be within MAX_REWRITE_DEPTH blocks
+					case check_rewrite_depth(TargetTxId) of
+						too_deep ->
+							{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+						not_confirmed ->
+							{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+						ok ->
+							RP2 = RP#{ ProposalTxId => Proposal#{ committed => true } },
+							RT2 = RT#{ TargetTxId => ReplacementTxId },
+							RR2 = RR#{ ReplacementTxId => TargetTxId },
+							{AA, WR, Balance, Boards, BM, UC, RP2, RA, RT2, RR2}
+					end
+			end
+	end;
+apply_admin_effect(_, _TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
+	{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}.
 
 %% ── Privileged type checks ──
 is_privileged_type(<<"Admin-Delete">>) -> true;
@@ -350,6 +442,9 @@ is_privileged_type(<<"Priority-Report">>) -> true;
 is_privileged_type(<<"Verified-Post">>) -> true;
 is_privileged_type(<<"Sticky-Post">>) -> true;
 is_privileged_type(<<"Cooldown-Bypass-Post">>) -> true;
+is_privileged_type(<<"Board">>) -> true;
+is_privileged_type(<<"Admin-Rewrite-Propose">>) -> true;
+is_privileged_type(<<"Admin-Rewrite-Commit">>) -> true;
 is_privileged_type(_) -> false.
 
 required_capability(<<"Admin-Delete">>) -> ?CAP_HIDE_POST;
@@ -363,6 +458,9 @@ required_capability(<<"Admin-Revoke">>) -> ?CAP_MANAGE_ROLES;
 required_capability(<<"Admin-Board-Close">>) -> ?CAP_MANAGE_ROLES;
 required_capability(<<"User-Grant">>) -> ?CAP_MANAGE_ROLES;
 required_capability(<<"User-Revoke">>) -> ?CAP_MANAGE_ROLES;
+required_capability(<<"Board">>) -> ?CAP_MANAGE_ROLES;
+required_capability(<<"Admin-Rewrite-Propose">>) -> ?CAP_REWRITE_CONTENT;
+required_capability(<<"Admin-Rewrite-Commit">>) -> ?CAP_REWRITE_CONTENT;
 required_capability(<<"Self-Delete">>) -> undefined; %% handled separately
 required_capability(<<"Edit-Post">>) -> undefined; %% handled separately
 required_capability(<<"Priority-Report">>) -> undefined; %% handled separately
@@ -413,6 +511,19 @@ has_valid_privileged_payload(TX, <<"Sticky-Post">>) ->
 	has_nonempty_tag(TX, <<"Target-TX">>) andalso has_nonempty_tag(TX, <<"Board-Id">>);
 has_valid_privileged_payload(TX, <<"Cooldown-Bypass-Post">>) ->
 	has_nonempty_tag(TX, <<"Board-Id">>);
+has_valid_privileged_payload(TX, <<"Board">>) ->
+	has_nonempty_tag(TX, <<"Board-Name">>) andalso has_nonempty_tag(TX, <<"Board-Id">>);
+has_valid_privileged_payload(TX, <<"Admin-Rewrite-Propose">>) ->
+	has_nonempty_tag(TX, <<"Target-TX">>) andalso
+	has_nonempty_tag(TX, <<"Target-Type">>) andalso
+	has_nonempty_tag(TX, <<"Board-Id">>) andalso
+	has_nonempty_tag(TX, <<"Thread-Id">>) andalso
+	has_nonempty_tag(TX, <<"Replacement-Hash">>) andalso
+	has_nonempty_tag(TX, <<"Reason">>);
+has_valid_privileged_payload(TX, <<"Admin-Rewrite-Commit">>) ->
+	has_nonempty_tag(TX, <<"Proposal-TX">>) andalso
+	has_nonempty_tag(TX, <<"Target-TX">>) andalso
+	has_nonempty_tag(TX, <<"Replacement-TX">>);
 has_valid_privileged_payload(_TX, _Type) ->
 	true.
 
@@ -466,19 +577,55 @@ get_user_capabilities() ->
 		[] -> element(6, initial_state())
 	end.
 
+get_rewrite_proposals() ->
+	case ets:lookup(node_state, rewrite_proposals) of
+		[{rewrite_proposals, RP}] -> RP;
+		[] -> element(7, initial_state())
+	end.
+
+get_rewrite_approvals() ->
+	case ets:lookup(node_state, rewrite_approvals) of
+		[{rewrite_approvals, RA}] -> RA;
+		[] -> element(8, initial_state())
+	end.
+
+get_rewritten_txs() ->
+	case ets:lookup(node_state, rewritten_txs) of
+		[{rewritten_txs, RT}] -> RT;
+		[] -> element(9, initial_state())
+	end.
+
+get_rewrite_reverse() ->
+	case ets:lookup(node_state, rewrite_reverse) of
+		[{rewrite_reverse, RR}] -> RR;
+		[] -> element(10, initial_state())
+	end.
+
 is_board_closed(BoardId) ->
 	lists:member(BoardId, get_closed_boards()).
 
+%% @doc Check if a TX has been rewritten (replaced by another TX).
+is_rewritten(TXID) ->
+	maps:is_key(TXID, get_rewritten_txs()).
+
+%% @doc Get the replacement TX ID for a rewritten TX.
+get_replacement_tx(TXID) ->
+	maps:get(TXID, get_rewritten_txs(), undefined).
+
 %% ── State entries for ETS ──
 initial_state_entries() ->
-	{AA, WR, Balance, Boards, BM, UC} = initial_state(),
+	{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR} = initial_state(),
 	[{admin_addresses, AA}, {wallet_roles, WR}, {admin_pool_balance, Balance},
-	 {closed_boards, Boards}, {board_moderators, BM}, {user_capabilities, UC}].
+	 {closed_boards, Boards}, {board_moderators, BM}, {user_capabilities, UC},
+	 {rewrite_proposals, RP}, {rewrite_approvals, RA},
+	 {rewritten_txs, RT}, {rewrite_reverse, RR}].
 
 current_state_entries() ->
-	{AA, WR, Balance, Boards, BM, UC} = current_state_from_chain(),
+	{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR} = current_state_from_chain(),
 	[{admin_addresses, AA}, {wallet_roles, WR}, {admin_pool_balance, Balance},
-	 {closed_boards, Boards}, {board_moderators, BM}, {user_capabilities, UC}].
+	 {closed_boards, Boards}, {board_moderators, BM}, {user_capabilities, UC},
+	 {rewrite_proposals, RP}, {rewrite_approvals, RA},
+	 {rewritten_txs, RT}, {rewrite_reverse, RR}].
 
 refresh_state() ->
 	Entries = current_state_entries(),
@@ -488,7 +635,9 @@ refresh_state() ->
 %% ── Internal helpers ──
 current_state() ->
 	{get_admin_addresses(), get_wallet_roles(), get_admin_pool_balance(),
-	 get_closed_boards(), get_board_moderators(), get_user_capabilities()}.
+	 get_closed_boards(), get_board_moderators(), get_user_capabilities(),
+	 get_rewrite_proposals(), get_rewrite_approvals(),
+	 get_rewritten_txs(), get_rewrite_reverse()}.
 
 current_state_from_chain() ->
 	InitialState = initial_state(),
@@ -542,7 +691,7 @@ initial_state() ->
 	AdminAddresses = lists:usort([decode_address(Address) || Address <- AdminAddresses0]),
 	WalletRoles = maps:from_list([{Addr, ?ROLE_ADMIN} || Addr <- AdminAddresses]),
 	AdminPoolBalance = get_configured_admin_pool(Config),
-	{AdminAddresses, WalletRoles, AdminPoolBalance, [], #{}, #{}}.
+	{AdminAddresses, WalletRoles, AdminPoolBalance, [], #{}, #{}, #{}, #{}, #{}, #{}}.
 
 read_genesis_config() ->
 	Path = case os:getenv("AR_ADMIN_CONFIG_PATH") of
@@ -598,6 +747,23 @@ get_genesis_wallets() ->
 		end;
 	(_) -> false
 	end, Wallets).
+
+%% @doc Check if a target TX is within the rewrite depth limit.
+%% Returns ok | too_deep | not_confirmed.
+check_rewrite_depth(TargetTxId) ->
+	case catch ar_storage:get_tx_confirmation_data(TargetTxId) of
+		{ok, {TargetHeight, _BlockHash}} ->
+			CurrentHeight = ar_node:get_height(),
+			Depth = CurrentHeight - TargetHeight,
+			case Depth >= 0 andalso Depth =< ?MAX_REWRITE_DEPTH of
+				true -> ok;
+				false -> too_deep
+			end;
+		not_found ->
+			not_confirmed;
+		{'EXIT', _} ->
+			not_confirmed
+	end.
 
 get_target_address(TX) ->
 	%% Decode the base64url-encoded address from the tag to raw binary,
@@ -657,7 +823,7 @@ get_capabilities_for_address(Address, AdminAddresses, WalletRoles) ->
 	end.
 
 role_capabilities(?ROLE_ADMIN) ->
-	[?CAP_HIDE_POST, ?CAP_BAN_USER, ?CAP_MANAGE_ROLES];
+	[?CAP_HIDE_POST, ?CAP_BAN_USER, ?CAP_MANAGE_ROLES, ?CAP_REWRITE_CONTENT];
 role_capabilities(?ROLE_MODERATOR) ->
 	[?CAP_HIDE_POST, ?CAP_BAN_USER];
 role_capabilities(?ROLE_BOARD_MODERATOR) ->
