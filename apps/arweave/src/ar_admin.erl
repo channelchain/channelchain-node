@@ -407,17 +407,23 @@ apply_admin_effect(<<"Admin-Rewrite-Commit">>, TX, AA, WR, Balance, Boards, BM, 
 					%% multi-rewrite, or replacement already used
 					{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 				false ->
-					%% Depth check: target TX must be within MAX_REWRITE_DEPTH blocks
+					%% Depth check
 					case check_rewrite_depth(TargetTxId) of
 						too_deep ->
 							{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 						not_confirmed ->
 							{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
 						ok ->
-							RP2 = RP#{ ProposalTxId => Proposal#{ committed => true } },
-							RT2 = RT#{ TargetTxId => ReplacementTxId },
-							RR2 = RR#{ ReplacementTxId => TargetTxId },
-							{AA, WR, Balance, Boards, BM, UC, RP2, RA, RT2, RR2}
+							%% Validate replacement TX: exists, correct type/board/thread, hash match
+							case validate_replacement_tx(ReplacementTxId, Proposal) of
+								false ->
+									{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+								true ->
+									RP2 = RP#{ ProposalTxId => Proposal#{ committed => true } },
+									RT2 = RT#{ TargetTxId => ReplacementTxId },
+									RR2 = RR#{ ReplacementTxId => TargetTxId },
+									{AA, WR, Balance, Boards, BM, UC, RP2, RA, RT2, RR2}
+							end
 					end
 			end
 	end;
@@ -747,6 +753,35 @@ get_genesis_wallets() ->
 		end;
 	(_) -> false
 	end, Wallets).
+
+%% @doc Validate that the replacement TX exists, is a Post, matches board/thread,
+%% has Rewrite-Replacement-For tag, and its data hash matches the proposal's Replacement-Hash.
+validate_replacement_tx(ReplacementTxId, Proposal) ->
+	case read_target_tx(ReplacementTxId) of
+		unavailable ->
+			false;
+		RepTX ->
+			%% Must be a ChannelChain Post
+			IsPost = get_tag(RepTX, <<"App-Name">>) =:= <<"ChannelChain">>
+				andalso get_tag(RepTX, <<"Type">>) =:= <<"Post">>,
+			%% Board-Id must match proposal
+			ProposalBoardId = maps:get(board_id, Proposal),
+			BoardMatch = get_tag(RepTX, <<"Board-Id">>) =:= ProposalBoardId,
+			%% Thread-Id must match proposal
+			ProposalThreadId = maps:get(thread_id, Proposal),
+			ThreadMatch = get_tag(RepTX, <<"Thread-Id">>) =:= ProposalThreadId,
+			%% Must have Rewrite-Replacement-For tag pointing to the target
+			TargetTxId = maps:get(target_txid, Proposal),
+			HasRewriteTag = get_tag(RepTX, <<"Rewrite-Replacement-For">>) =:= TargetTxId,
+			%% Data hash must match proposal's Replacement-Hash
+			ProposalHash = maps:get(replacement_hash, Proposal),
+			DataHash = case RepTX#tx.data of
+				<<>> -> <<>>;
+				Data -> ar_util:encode(crypto:hash(sha256, Data))
+			end,
+			HashMatch = DataHash =:= ProposalHash,
+			IsPost andalso BoardMatch andalso ThreadMatch andalso HasRewriteTag andalso HashMatch
+	end.
 
 %% @doc Check if a target TX is within the rewrite depth limit.
 %% Returns ok | too_deep | not_confirmed.

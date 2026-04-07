@@ -366,49 +366,37 @@ do_query(Filters) ->
     end,
 
     %% Fetch tags for each TX ID.
-    %% - Deleted TXs are excluded.
-    %% - Rewritten TXs are replaced by their replacement TX (preserving position).
-    %% - Replacement TXs that appear in their own right are excluded (to avoid duplicates).
+    %% Priority: rewrite > delete. A rewritten TX is shown as its replacement
+    %% even if the original was Admin-Deleted (delete → rewrite workflow).
+    %% Replacement TXs appearing in their own position are excluded (no duplicates).
     ReplacementTXIDs = sets:from_list([
         RepId || {_OldId, RepId} <- ets:tab2list(?REWRITTEN_TXS_TABLE)
     ]),
     WithTags = lists:filtermap(fun(TXID) ->
-        case ets:member(?DELETED_TXS_TABLE, TXID) of
+        %% First check if this TX is a replacement TX in its own position → skip
+        case sets:is_element(TXID, ReplacementTXIDs) of
             true -> false;
             false ->
-                %% Check if this TX is a replacement TX appearing in its own position
-                %% (skip it here — it will appear at the original TX's position instead)
-                case sets:is_element(TXID, ReplacementTXIDs) of
-                    true -> false;
-                    false ->
-                        %% Check if this TX has been rewritten → substitute with replacement
-                        {EffectiveTXID, IsRewritten} = case ets:lookup(?REWRITTEN_TXS_TABLE, TXID) of
-                            [{TXID, ReplacementTXID}] -> {ReplacementTXID, true};
-                            [] -> {TXID, false}
-                        end,
-                        case ets:lookup(?TX_TAGS_TABLE, EffectiveTXID) of
-                            [{EffectiveTXID, Tags}] ->
-                                %% For rewritten TXs, add metadata tag so clients know
-                                EffTags = case IsRewritten of
-                                    true -> [{<<"Rewritten-From">>, TXID} | Tags];
-                                    false -> Tags
-                                end,
-                                %% Don't filter out admin operations based on board status
-                                case TypeFilter of
-                                    <<"Admin-Op">> -> {true, {EffectiveTXID, EffTags}};
-                                    <<"Moderator-Op">> -> {true, {EffectiveTXID, EffTags}};
-                                    _ ->
-                                        case IncludeClosed of
-                                            true -> {true, {EffectiveTXID, EffTags}};
-                                            false ->
-                                                BoardIdFromTags = get_tag_value(Tags, <<"Board-Id">>),
-                                                case BoardIdFromTags =/= undefined andalso ar_admin:is_board_closed(BoardIdFromTags) of
-                                                    true -> false;
-                                                    false -> {true, {EffectiveTXID, EffTags}}
-                                                end
-                                        end
-                                end;
+                %% Check rewrite BEFORE delete — rewrite takes priority
+                case ets:lookup(?REWRITTEN_TXS_TABLE, TXID) of
+                    [{TXID, ReplacementTXID}] ->
+                        %% Rewritten: substitute with replacement TX
+                        case ets:lookup(?TX_TAGS_TABLE, ReplacementTXID) of
+                            [{ReplacementTXID, Tags}] ->
+                                EffTags = [{<<"Rewritten-From">>, TXID} | Tags],
+                                apply_board_filter(TypeFilter, IncludeClosed, ReplacementTXID, Tags, EffTags);
                             [] -> false
+                        end;
+                    [] ->
+                        %% Not rewritten: check if deleted
+                        case ets:member(?DELETED_TXS_TABLE, TXID) of
+                            true -> false;
+                            false ->
+                                case ets:lookup(?TX_TAGS_TABLE, TXID) of
+                                    [{TXID, Tags}] ->
+                                        apply_board_filter(TypeFilter, IncludeClosed, TXID, Tags, Tags);
+                                    [] -> false
+                                end
                         end
                 end
         end
@@ -424,6 +412,23 @@ do_query(Filters) ->
     lists:sublist(Sorted, First).
 
 %% @doc Get all indexed TX IDs.
+%% @doc Apply board-closed filter. Returns {true, {TXID, Tags}} or false.
+apply_board_filter(TypeFilter, IncludeClosed, TXID, RawTags, EffTags) ->
+    case TypeFilter of
+        <<"Admin-Op">> -> {true, {TXID, EffTags}};
+        <<"Moderator-Op">> -> {true, {TXID, EffTags}};
+        _ ->
+            case IncludeClosed of
+                true -> {true, {TXID, EffTags}};
+                false ->
+                    BoardIdFromTags = get_tag_value(RawTags, <<"Board-Id">>),
+                    case BoardIdFromTags =/= undefined andalso ar_admin:is_board_closed(BoardIdFromTags) of
+                        true -> false;
+                        false -> {true, {TXID, EffTags}}
+                    end
+            end
+    end.
+
 all_txids() ->
     [TXID || {TXID, _Tags} <- ets:tab2list(?TX_TAGS_TABLE)].
 
