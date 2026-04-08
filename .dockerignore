@@ -1,0 +1,7 @@
+_build/
+_build_docker_arm64/
+.git/
+data/
+*.beam.bak
+apps/arweave/lib/**/build/
+apps/arweave/lib/**/build*/

@@ -1,0 +1,52 @@
+# =============================================
+# ChannelChain Node — 本番用 Multi-stage Build
+# =============================================
+# Stage 1: 依存取得 + コンパイル + リリース生成
+# Stage 2: 軽量ランタイムイメージ
+#
+# ビルド:
+#   docker build -f Dockerfile.prod -t channelchain-node .
+# =============================================
+
+# ── Stage 1: Builder ──
+FROM erlang:26 AS builder
+
+WORKDIR /build
+
+# OS 依存（NIF コンパイル用）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake gcc g++ git make libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# rebar3 依存を先にフェッチ（キャッシュ効率化）
+COPY rebar.config rebar.lock* ./
+RUN rebar3 get-deps || true
+
+# ソース全体をコピー（.dockerignore で不要ファイルを除外）
+COPY . .
+
+# コンパイル + リリース生成
+RUN rebar3 as prod release
+
+# ── Stage 2: Runtime ──
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 libncurses6 netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# リリースをコピー
+COPY --from=builder /build/_build/prod/rel/arweave/ /app/
+
+# ジェネシス設定
+COPY config/genesis_block.json /app/config/genesis_block.json
+
+# entrypoint
+COPY entrypoint.prod.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 1984
+
+ENTRYPOINT ["/app/entrypoint.sh"]
