@@ -10,8 +10,7 @@
   },
   "admin": {
     "admin_addresses": [
-      "p596SOfasdmZpxisvQxZ_v6Ok_Sk_Sk_Sk_Sk_Sk_Sk_S",
-      "p596SOfasdmZpxisvQxZ_v6Ok_Sk_Sk_Sk_Sk_Sk_Sk_T"
+      "jus4c3Odh9dPqm1UjjOpIqEQU5eK23Wd2_AwWTU9Z5E"
     ],
     "delete_cost": 1000,
     "ban_cost": 10000,
@@ -20,7 +19,7 @@
   },
   "wallets": [
     {
-      "address": "b3fSq45qUwZgsrejjrwWqAiOyKysM7gJeGOG534CHtg",
+      "address": "jus4c3Odh9dPqm1UjjOpIqEQU5eK23Wd2_AwWTU9Z5E",
       "balance": 10000000000000
     }
   ],
