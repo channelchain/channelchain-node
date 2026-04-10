@@ -32,7 +32,7 @@ RUN rebar3 as prod release
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl3 libncurses6 netcat-openbsd \
+    libssl3 libncurses6 netcat-openbsd procps \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

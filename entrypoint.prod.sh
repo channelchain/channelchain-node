@@ -2,7 +2,6 @@
 
 DATA_DIR="/data"
 RELEASE_DIR="/app/bin"
-ERL="erl"
 
 # ピアリストを引数に変換
 PEER_ARGS=""
@@ -24,36 +23,16 @@ if [ "$MINE" = "true" ]; then
   MINE_ARG="mine"
 fi
 
-# Wallet事前生成
+# Wallet事前生成（release バンドルの create-wallet を使用）
 ensure_wallet() {
   local WALLET_DIR="$DATA_DIR/wallets"
   local WALLET_FILE=$(ls "$WALLET_DIR"/arweave_keyfile_*.json 2>/dev/null | head -1)
   if [ -n "$WALLET_FILE" ]; then
     return 0
   fi
-  echo "==> Generating wallet..."
+  echo "==> Generating wallet via /app/bin/create-wallet..."
   mkdir -p "$WALLET_DIR"
-  $ERL -noshell -eval '
-    {[E, N], [E, N, D, P1, P2, E1, E2, C]} =
-        crypto:generate_key(rsa, {4096, 65537}),
-    Encode = fun(Bin) ->
-        B64 = base64:encode(Bin),
-        B64a = binary:replace(B64, <<"+">>, <<"-">>, [global]),
-        B64b = binary:replace(B64a, <<"/">>, <<"_">>, [global]),
-        binary:replace(B64b, <<"=">>, <<>>, [global])
-    end,
-    Addr = Encode(crypto:hash(sha256, N)),
-    JWK = io_lib:format(
-        "{\"kty\":\"RSA\",\"ext\":true,\"e\":\"~s\",\"n\":\"~s\","
-        "\"d\":\"~s\",\"p\":\"~s\",\"q\":\"~s\","
-        "\"dp\":\"~s\",\"dq\":\"~s\",\"qi\":\"~s\"}",
-        [Encode(E), Encode(N), Encode(D),
-         Encode(P1), Encode(P2), Encode(E1), Encode(E2), Encode(C)]),
-    Filename = "'"$WALLET_DIR"'/arweave_keyfile_" ++ binary_to_list(Addr) ++ ".json",
-    ok = file:write_file(Filename, list_to_binary(JWK)),
-    io:format("~s~n", [Addr]),
-    halt(0).
-  '
+  $RELEASE_DIR/create-wallet "$DATA_DIR" 2>&1 || true
 }
 
 ensure_wallet
