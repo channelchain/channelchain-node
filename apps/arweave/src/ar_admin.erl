@@ -143,6 +143,8 @@ validate_capabilities(<<"Cooldown-Bypass-Post">>, _TX, OwnerAddr, _AA, _WR, _BM,
 	lists:member(?CAP_BYPASS_COOLDOWN, Caps);
 validate_capabilities(Type, TX, OwnerAddr, AdminAddresses, WalletRoles, BoardMods, _UserCaps) ->
 	Capabilities = get_capabilities_for_address(OwnerAddr, AdminAddresses, WalletRoles),
+	EffectiveRoles = ensure_admin_roles(AdminAddresses, WalletRoles),
+	OwnerRole = maps:get(OwnerAddr, EffectiveRoles, undefined),
 	case required_capability(Type) of
 		undefined ->
 			false;
@@ -151,12 +153,18 @@ validate_capabilities(Type, TX, OwnerAddr, AdminAddresses, WalletRoles, BoardMod
 			case HasCap of
 				false -> false;
 				true ->
-					%% Board-Moderator scope enforcement
-					case Type of
-						<<"Board-Moderator-Hide">> ->
+					%% Role-based TX type restriction:
+					%% board-moderator can only use Board-Moderator-* TX types
+					%% moderator can only use Moderator-* or Board-Moderator-* TX types
+					case {OwnerRole, Type} of
+						{?ROLE_BOARD_MODERATOR, <<"Board-Moderator-Hide">>} ->
 							validate_board_scope(OwnerAddr, TX, BoardMods);
-						<<"Board-Moderator-Ban">> ->
+						{?ROLE_BOARD_MODERATOR, <<"Board-Moderator-Ban">>} ->
 							validate_board_scope(OwnerAddr, TX, BoardMods);
+						{?ROLE_BOARD_MODERATOR, _} ->
+							false;
+						{?ROLE_MODERATOR, <<"Admin-", _/binary>>} ->
+							false;
 						_ ->
 							true
 					end

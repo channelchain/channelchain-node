@@ -1,0 +1,29 @@
+# =============================================
+# ChannelChain Node — 開発用イメージ
+# =============================================
+# ソースはマウント、ビルド成果物は volume でキャッシュ
+#
+# ビルド:
+#   docker build -f Dockerfile.dev -t channelchain-node-dev .
+#
+# 実行:
+#   docker run -v $(pwd):/src -v chain-build:/src/_build \
+#     -v chain-data:/data -p 1984:1984 channelchain-node-dev
+# =============================================
+
+FROM erlang:26
+
+WORKDIR /src
+
+# NIF コンパイル用
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake gcc g++ git make libssl-dev netcat-openbsd procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# entrypoint: ソースマウント → 差分ビルド → 起動
+COPY entrypoint.dev.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 1984
+
+ENTRYPOINT ["/entrypoint.sh"]
