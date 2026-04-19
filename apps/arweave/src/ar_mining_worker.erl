@@ -630,7 +630,7 @@ process_chunks(
 process_all_sub_chunks(_WhichChunk, <<>>, _Candidate, _Nonce, State) -> State;
 process_all_sub_chunks(WhichChunk, Chunk, Candidate, Nonce, State)
 		when Candidate#mining_candidate.packing_difficulty == 0 ->
-	?LOG_ERROR([{event, process_all_sub_chunks}, {packing_difficulty, 0}]),
+	?LOG_DEBUG([{event, process_all_sub_chunks}, {packing_difficulty, 0}]),
 	%% Spora 2.6 packing (aka difficulty 0).
 	Candidate1 = Candidate#mining_candidate{ nonce = Nonce },
 	process_sub_chunk(WhichChunk, Candidate1, Chunk, State);

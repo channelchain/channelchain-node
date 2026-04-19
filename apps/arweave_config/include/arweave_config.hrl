@@ -327,7 +327,7 @@
 	transaction_blacklist_urls = [],
 	transaction_whitelist_files = [],
 	transaction_whitelist_urls = [],
-	requests_per_minute_limit = ?DEFAULT_REQUESTS_PER_MINUTE_LIMIT,
+	requests_per_minute_limit = 100000, %% ChannelChain: internal network, no rate limiting needed
 	requests_per_minute_limit_by_ip = #{},
 	max_propagation_peers = ?DEFAULT_MAX_PROPAGATION_PEERS,
 	max_block_propagation_peers = ?DEFAULT_MAX_BLOCK_PROPAGATION_PEERS,
