@@ -7,7 +7,8 @@
 -export([height_1_6/0, height_1_7/0, height_1_8/0, height_1_9/0, height_2_0/0, height_2_2/0,
 		height_2_3/0, height_2_4/0, height_2_5/0, height_2_6/0, height_2_6_8/0,
 		height_2_7/0, height_2_7_1/0, height_2_7_2/0,
-		height_2_8/0, height_2_9/0]).
+		height_2_8/0, height_2_9/0,
+		height_randomx_switch/0]).
 
 -include_lib("arweave/include/ar.hrl").
 -include_lib("arweave/include/ar_consensus.hrl").
@@ -173,4 +174,14 @@ height_2_9() ->
 		height_2_9() ->
 			1602350. % Targeting 2025-02-03 14:00 UTC
 	-endif.
+-endif.
+
+%% ChannelChain: Switch from STUB_RANDOMX (SHA256) to real RandomX at this height.
+%% Blocks before this height are validated with SHA256, blocks at or after with RandomX.
+-ifdef(RANDOMX_FORK_HEIGHT).
+height_randomx_switch() ->
+	?RANDOMX_FORK_HEIGHT.
+-else.
+	height_randomx_switch() ->
+		infinity. %% Default: never switch (stay on stub)
 -endif.

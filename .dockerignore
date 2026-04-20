@@ -3,5 +3,7 @@ _build_docker_arm64/
 .git/
 data/
 *.beam.bak
-apps/arweave/lib/**/build/
-apps/arweave/lib/**/build*/
+apps/arweave/lib/RandomX/build512/
+apps/arweave/lib/RandomX/build4096/
+apps/arweave/lib/RandomX/buildsquared/
+apps/arweave/lib/secp256k1/build/

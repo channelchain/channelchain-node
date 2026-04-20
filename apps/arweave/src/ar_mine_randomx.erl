@@ -1,6 +1,6 @@
 -module(ar_mine_randomx).
 
--export([init_fast/3, init_light/2, info/1, hash/2, hash/5,
+-export([init_fast/3, init_fast_real/3, init_light/2, info/1, hash/2, hash/5,
 		randomx_encrypt_chunk/4,
 		randomx_decrypt_chunk/5,
 		randomx_decrypt_sub_chunk/5,
@@ -27,11 +27,16 @@ init_fast(RxMode, Key, _Threads) ->
 	{RxMode, {stub_state, Key}}.
 init_light(RxMode, Key) ->
 	{RxMode, {stub_state, Key}}.
+%% Initialize real RandomX state (used for post-fork mining even when STUB_RANDOMX is defined).
+init_fast_real(RxMode, Key, Threads) ->
+	init_fast2(RxMode, Key, jit(), large_pages(), Threads).
 -else.
 init_fast(RxMode, Key, Threads) ->
 	init_fast2(RxMode, Key, jit(), large_pages(), Threads).
 init_light(RxMode, Key) ->
 	init_light2(RxMode, jit(), large_pages(), Key).
+init_fast_real(RxMode, Key, Threads) ->
+	init_fast2(RxMode, Key, jit(), large_pages(), Threads).
 -endif.
 
 info(State) ->

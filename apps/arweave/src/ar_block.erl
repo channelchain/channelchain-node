@@ -7,7 +7,7 @@
 		get_replica_2_9_footprint_size/0, strict_data_split_threshold/0,
 		block_field_size_limit/1, verify_timestamp/2, get_max_timestamp_deviation/0, verify_last_retarget/2,
 		verify_weave_size/3, verify_cumulative_diff/2, verify_block_hash_list_merkle/2,
-		compute_hash_list_merkle/1, compute_h0/2, compute_h0/5, compute_h0/6,
+		compute_hash_list_merkle/1, compute_h0/2, compute_h0/5, compute_h0/6, compute_h0/7,
 		compute_h1/3, compute_h2/3, compute_solution_h/2,
 		indep_hash/1, indep_hash/2, indep_hash2/2, get_block_signature_preimage/4,
 		generate_signed_hash/1, verify_signature/3, get_reward_key/2,
@@ -211,20 +211,35 @@ compute_hash_list_merkle(B) ->
 compute_h0(B, PrevB) ->
 	#block{ nonce_limiter_info = NonceLimiterInfo,
 			partition_number = PartitionNumber, reward_addr = MiningAddr,
-			packing_difficulty = PackingDifficulty } = B,
+			packing_difficulty = PackingDifficulty, height = Height } = B,
 	PrevNonceLimiterInfo = PrevB#block.nonce_limiter_info,
 	Seed = PrevNonceLimiterInfo#nonce_limiter_info.seed,
 	NonceLimiterOutput = NonceLimiterInfo#nonce_limiter_info.output,
-	compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty).
+	compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty,
+			ar_packing_server:get_packing_state(), Height).
 
 compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty) ->
+	%% Called from mining — use current chain height + 1 (next block)
+	Height = case catch ar_node:get_height() of
+		H when is_integer(H) -> H + 1;
+		_ -> 0
+	end,
 	compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty,
-			ar_packing_server:get_packing_state()).
+			ar_packing_server:get_packing_state(), Height).
 
 %% @doc Compute "h0" - a cryptographic hash used as a source of entropy when choosing
 %% two recall ranges on the weave as unlocked by the given nonce limiter output.
 compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty,
 		PackingState) ->
+	Height = case catch ar_node:get_height() of
+		H when is_integer(H) -> H + 1;
+		_ -> 0
+	end,
+	compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty,
+			PackingState, Height).
+
+compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficulty,
+		PackingState, Height) ->
 	Preimage =
 		case PackingDifficulty of
 			0 ->
@@ -235,7 +250,7 @@ compute_h0(NonceLimiterOutput, PartitionNumber, Seed, MiningAddr, PackingDifficu
 					PartitionNumber:256, Seed:32/binary, MiningAddr/binary,
 					PackingDifficulty:8 >>
 		end,
-	RandomXState = ar_packing_server:get_randomx_state_for_h0(PackingDifficulty, PackingState),
+	RandomXState = ar_packing_server:get_randomx_state_for_h0(PackingDifficulty, PackingState, Height),
 	ar_mine_randomx:hash(RandomXState, Preimage).
 
 %% @doc Compute "h1" - a cryptographic hash which is either the hash of a solution not

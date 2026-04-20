@@ -1,29 +1,48 @@
 # =============================================
 # ChannelChain Node — 開発用イメージ
 # =============================================
-# ソースはマウント、ビルド成果物は volume でキャッシュ
-#
-# ビルド:
-#   docker build -f Dockerfile.dev -t channelchain-node-dev .
-#
-# 実行:
-#   docker run -v $(pwd):/src -v chain-build:/src/_build \
-#     -v chain-data:/data -p 1984:1984 channelchain-node-dev
-# =============================================
+FROM erlang:26 AS builder
 
-FROM erlang:26
+WORKDIR /build
 
-WORKDIR /src
-
-# NIF コンパイル用
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake gcc g++ git make libssl-dev netcat-openbsd procps \
+    cmake gcc g++ git make libssl-dev perl \
     && rm -rf /var/lib/apt/lists/*
 
-# entrypoint: ソースマウント → 差分ビルド → 起動
-COPY entrypoint.dev.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY rebar.config rebar.lock* ./
+RUN rebar3 get-deps || true
+
+COPY . .
+
+# openssl-sha-lite Configure + rebar3 ビルド
+RUN bash -c '\
+  cd apps/arweave/lib/openssl-sha-lite && \
+  rm -f libcrypto.a libcrypto.so* *.o 2>/dev/null; \
+  find . -name "*.o" -delete 2>/dev/null; \
+  ARCH=$(uname -m) && \
+  echo "Architecture: $ARCH" && \
+  if [[ "$ARCH" == "aarch64" || "$ARCH" == "arm64" ]]; then \
+    perl Configure linux-aarch64 no-shared no-threads no-asm -fPIC; \
+  else \
+    perl Configure linux-x86_64 no-shared no-threads no-asm -fPIC; \
+  fi && \
+  cd /build && \
+  rebar3 as prod release'
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libssl3 libncurses6 netcat-openbsd procps \
+    libstdc++6 libgcc-s1 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /build/_build/prod/rel/arweave/ /app/
+COPY config/genesis_block.json /app/config/genesis_block.json
+COPY entrypoint.prod.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 1984
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]

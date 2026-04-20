@@ -2,7 +2,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, packing_atom/1, get_packing_state/0, get_randomx_state_for_h0/2,
+-export([start_link/0, packing_atom/1, get_packing_state/0, get_randomx_state_for_h0/2, get_randomx_state_for_h0/3,
 		request_unpack/2, request_unpack/3, request_repack/2, request_repack/3,
 		request_encipher/3, request_decipher/3,
 		pack/4, unpack/5, repack/6, unpack_sub_chunk/5,
@@ -227,6 +227,28 @@ get_randomx_state_for_h0(PackingDifficulty, PackingState) ->
 			RandomXState4096
 	end.
 
+%% ChannelChain: height-aware version for RandomX fork.
+%% Before fork height: use stub (SHA256) state.
+%% At or after fork height: use real RandomX state.
+get_randomx_state_for_h0(PackingDifficulty, PackingState, Height) ->
+	ForkHeight = ar_fork:height_randomx_switch(),
+	case ForkHeight =/= infinity andalso Height >= ForkHeight of
+		true ->
+			case ets:lookup(?MODULE, randomx_real_packing_state) of
+				[{_, RealPackingState}] ->
+					{RealState512, RealState4096, _} = RealPackingState,
+					case PackingDifficulty of
+						0 -> RealState512;
+						_ -> RealState4096
+					end;
+				[] ->
+					%% Fallback: real state not initialized
+					get_randomx_state_for_h0(PackingDifficulty, PackingState)
+			end;
+		false ->
+			get_randomx_state_for_h0(PackingDifficulty, PackingState)
+	end.
+
 %% @doc Encipher the given chunk with the given 2.9 entropy assembled for this chunk.
 %% Encipher and decipher are the same operation, only difference is how we record the operation.
 -spec encipher_replica_2_9_chunk(
@@ -441,6 +463,17 @@ init_packing_state() ->
 			?RANDOMX_PACKING_KEY, Schedulers),
 	PackingState = {RandomXState512, RandomXState4096, RandomXStateSharedEntropy},
 	ets:insert(?MODULE, {randomx_packing_state, PackingState}),
+	%% ChannelChain: also initialize real RandomX state for post-fork use.
+	case ar_fork:height_randomx_switch() of
+		infinity ->
+			ok;
+		_ ->
+			RealState512 = ar_mine_randomx:init_fast_real(rx512, ?RANDOMX_PACKING_KEY, Schedulers),
+			RealState4096 = ar_mine_randomx:init_fast_real(rx4096, ?RANDOMX_PACKING_KEY, Schedulers),
+			RealStateEntropy = ar_mine_randomx:init_fast_real(rxsquared, ?RANDOMX_PACKING_KEY, Schedulers),
+			RealPackingState = {RealState512, RealState4096, RealStateEntropy},
+			ets:insert(?MODULE, {randomx_real_packing_state, RealPackingState})
+	end,
 	PackingState.
 
 get_randomx_state_by_packing({composite, _, _}, {_, RandomXState, _}) ->
