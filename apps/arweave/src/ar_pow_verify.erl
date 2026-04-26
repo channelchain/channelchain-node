@@ -1,6 +1,6 @@
 -module(ar_pow_verify).
 
--export([validate_tx_pow/1, check_leading_zeros/2, get_current_difficulty/0]).
+-export([validate_tx_pow/1, check_leading_zeros/2, get_current_difficulty/0, get_difficulty_for_board/1]).
 
 -include_lib("arweave/include/ar.hrl").
 
@@ -32,7 +32,19 @@ validate_tx_pow(TX) ->
 			DataBin = TX#tx.data,
 			Input = <<DataBin/binary, NonceBin/binary>>,
 			Hash = crypto:hash(sha256, Input),
-			Difficulty = get_current_difficulty(),
+			%% Check for board-specific difficulty
+			BoardId = case lists:keyfind(<<"Board-Id">>, 1, TX#tx.tags) of
+				{<<"Board-Id">>, BId} -> BId;
+				false -> undefined
+			end,
+			TxType = case lists:keyfind(<<"Type">>, 1, TX#tx.tags) of
+				{<<"Type">>, T} -> T;
+				false -> undefined
+			end,
+			Difficulty = case TxType of
+				<<"Report">> -> get_report_difficulty(BoardId);
+				_ -> get_difficulty_for_board(BoardId)
+			end,
 			check_leading_zeros(Hash, Difficulty)
 	end.
 
@@ -58,6 +70,40 @@ count_recent_txs() ->
 		ets:info(channelchain_tx_tags, size)
 	catch
 		_:_ -> 0
+	end.
+
+%% @doc Get difficulty for a specific board.
+%% pow_difficulty is a percentage coefficient: 100 = default, 50 = half, 200 = double.
+%% Minimum difficulty is 4.
+get_difficulty_for_board(undefined) ->
+	get_current_difficulty();
+get_difficulty_for_board(BoardId) ->
+	BaseDifficulty = get_current_difficulty(),
+	case ar_admin:get_board_config(BoardId, <<"pow_difficulty">>) of
+		undefined -> BaseDifficulty;
+		ValBin ->
+			try
+				Pct = binary_to_integer(ValBin),
+				max(BaseDifficulty * Pct div 100, 4)
+			catch _:_ -> BaseDifficulty
+			end
+	end.
+
+%% @doc Get report difficulty for a specific board.
+%% report_pow_difficulty is a percentage coefficient: 100 = same as post, 50 = half of post.
+%% Default is 50% of post difficulty. Minimum 4.
+get_report_difficulty(undefined) ->
+	max(get_current_difficulty() div 2, 4);
+get_report_difficulty(BoardId) ->
+	PostDifficulty = get_difficulty_for_board(BoardId),
+	case ar_admin:get_board_config(BoardId, <<"report_pow_difficulty">>) of
+		undefined -> max(PostDifficulty div 2, 4);
+		ValBin ->
+			try
+				Pct = binary_to_integer(ValBin),
+				max(PostDifficulty * Pct div 100, 4)
+			catch _:_ -> max(PostDifficulty div 2, 4)
+			end
 	end.
 
 %% @doc Check if the hash has the required number of leading zero bits.

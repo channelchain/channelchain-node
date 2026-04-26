@@ -52,7 +52,8 @@ get_info() ->
         <<"closed_boards">> => ClosedBoards,
         <<"board_moderators">> => format_board_moderators(ar_admin:get_board_moderators()),
         <<"user_capabilities">> => format_user_capabilities(ar_admin:get_user_capabilities()),
-        <<"pow_difficulty">> => ar_pow_verify:get_current_difficulty()
+        <<"pow_difficulty">> => ar_pow_verify:get_current_difficulty(),
+        <<"board_configs">> => ar_admin:get_board_configs()
     }.
 
 format_board_moderators(BM) ->

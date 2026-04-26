@@ -25,6 +25,8 @@
 	get_rewrite_approvals/0,
 	get_rewritten_txs/0,
 	get_rewrite_reverse/0,
+	get_board_configs/0,
+	get_board_config/2,
 	is_board_closed/1,
 	is_rewritten/1,
 	get_replacement_tx/1,
@@ -46,6 +48,7 @@
 -define(MODERATOR_BAN_COST,       10000000000).   %% 0.01 TOKEN
 -define(BOARD_MOD_HIDE_COST,       500000000).    %% 0.0005 TOKEN
 -define(BOARD_MOD_BAN_COST,        500000000).    %% 0.0005 TOKEN
+-define(BOARD_CONFIG_COST,         500000000).    %% 0.0005 TOKEN
 -define(USER_GRANT_COST,          50000000000).   %% 0.05 TOKEN
 -define(USER_REVOKE_COST,         50000000000).   %% 0.05 TOKEN
 -define(SELF_DELETE_COST,          200000000).     %% 0.0002 TOKEN
@@ -64,6 +67,7 @@
 -define(CAP_BAN_USER, <<"can_ban_user">>).
 -define(CAP_MANAGE_ROLES, <<"can_manage_roles">>).
 -define(CAP_REWRITE_CONTENT, <<"can_rewrite_content">>).
+-define(CAP_CONFIGURE_BOARD, <<"can_configure_board">>).
 
 %% ── User Capabilities ──
 -define(CAP_SELF_DELETE_POST, <<"can_self_delete_post">>).
@@ -75,7 +79,16 @@
 
 -define(VALID_USER_CAPS, [?CAP_SELF_DELETE_POST, ?CAP_EDIT_POST,
 	?CAP_VERIFIED_POST, ?CAP_PRIORITY_REPORT,
-	?CAP_STICKY_POST, ?CAP_BYPASS_COOLDOWN]).
+	?CAP_STICKY_POST, ?CAP_BYPASS_COOLDOWN, ?CAP_CONFIGURE_BOARD]).
+
+-define(VALID_BOARD_CONFIG_KEYS, [
+	<<"pow_difficulty">>, <<"default_name">>, <<"max_body_bytes">>,
+	<<"max_name_bytes">>, <<"max_title_bytes">>, <<"cooldown_sec">>,
+	<<"thread_create_cooldown_sec">>, <<"force_id">>, <<"force_no_id">>,
+	<<"max_posts_per_thread">>, <<"default_sort">>,
+	<<"thread_rate_limit_max">>, <<"thread_rate_limit_window_sec">>,
+	<<"report_pow_difficulty">>, <<"board_rules">>
+]).
 
 %%%===================================================================
 %%% State: 10-tuple
@@ -141,6 +154,24 @@ validate_capabilities(<<"Sticky-Post">>, _TX, OwnerAddr, _AA, _WR, _BM, UserCaps
 validate_capabilities(<<"Cooldown-Bypass-Post">>, _TX, OwnerAddr, _AA, _WR, _BM, UserCaps) ->
 	Caps = maps:get(OwnerAddr, UserCaps, []),
 	lists:member(?CAP_BYPASS_COOLDOWN, Caps);
+validate_capabilities(<<"Board-Config">>, TX, OwnerAddr, AdminAddresses, WalletRoles, BoardMods, UserCaps) ->
+	%% Admin can configure any board
+	%% Moderator with can_configure_board can configure any board
+	%% Board Moderator with can_configure_board can configure their boards
+	EffectiveRoles = ensure_admin_roles(AdminAddresses, WalletRoles),
+	OwnerRole = maps:get(OwnerAddr, EffectiveRoles, undefined),
+	BoardId = get_tag(TX, <<"Board-Id">>),
+	UserCapsForAddr = maps:get(OwnerAddr, UserCaps, []),
+	case OwnerRole of
+		?ROLE_ADMIN -> true;
+		?ROLE_MODERATOR ->
+			lists:member(?CAP_CONFIGURE_BOARD, UserCapsForAddr);
+		?ROLE_BOARD_MODERATOR ->
+			ModBoards = maps:get(OwnerAddr, BoardMods, []),
+			lists:member(BoardId, ModBoards) andalso
+				lists:member(?CAP_CONFIGURE_BOARD, UserCapsForAddr);
+		_ -> false
+	end;
 validate_capabilities(Type, TX, OwnerAddr, AdminAddresses, WalletRoles, BoardMods, _UserCaps) ->
 	Capabilities = get_capabilities_for_address(OwnerAddr, AdminAddresses, WalletRoles),
 	EffectiveRoles = ensure_admin_roles(AdminAddresses, WalletRoles),
@@ -244,6 +275,7 @@ get_admin_cost(<<"Cooldown-Bypass-Post">>) -> 0; %% paid by user wallet via TX q
 get_admin_cost(<<"Board">>) -> 0; %% board creation is free for admin
 get_admin_cost(<<"Admin-Rewrite-Propose">>) -> 0;
 get_admin_cost(<<"Admin-Rewrite-Commit">>) -> 0;
+get_admin_cost(<<"Board-Config">>) -> ?BOARD_CONFIG_COST;
 get_admin_cost(_) -> 0.
 
 %% ── State application ──
@@ -435,6 +467,25 @@ apply_admin_effect(<<"Admin-Rewrite-Commit">>, TX, AA, WR, Balance, Boards, BM, 
 					end
 			end
 	end;
+apply_admin_effect(<<"Board-Config">>, TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
+	BoardId = get_tag(TX, <<"Board-Id">>),
+	ConfigKey = get_tag(TX, <<"Config-Key">>),
+	ConfigValue = get_tag(TX, <<"Config-Value">>),
+	case BoardId =/= undefined andalso ConfigKey =/= undefined of
+		true ->
+			%% Store in ETS: {board_configs, #{BoardId => #{Key => Value}}}
+			Existing = case ets:lookup(node_state, board_configs) of
+				[{board_configs, M}] -> M;
+				[] -> #{}
+			end,
+			BoardMap = maps:get(BoardId, Existing, #{}),
+			BoardMap2 = BoardMap#{ ConfigKey => ConfigValue },
+			Existing2 = Existing#{ BoardId => BoardMap2 },
+			ets:insert(node_state, {board_configs, Existing2}),
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR};
+		false ->
+			{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}
+	end;
 apply_admin_effect(_, _TX, AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR) ->
 	{AA, WR, Balance, Boards, BM, UC, RP, RA, RT, RR}.
 
@@ -459,6 +510,7 @@ is_privileged_type(<<"Cooldown-Bypass-Post">>) -> true;
 is_privileged_type(<<"Board">>) -> true;
 is_privileged_type(<<"Admin-Rewrite-Propose">>) -> true;
 is_privileged_type(<<"Admin-Rewrite-Commit">>) -> true;
+is_privileged_type(<<"Board-Config">>) -> true;
 is_privileged_type(_) -> false.
 
 required_capability(<<"Admin-Delete">>) -> ?CAP_HIDE_POST;
@@ -475,6 +527,7 @@ required_capability(<<"User-Revoke">>) -> ?CAP_MANAGE_ROLES;
 required_capability(<<"Board">>) -> ?CAP_MANAGE_ROLES;
 required_capability(<<"Admin-Rewrite-Propose">>) -> ?CAP_REWRITE_CONTENT;
 required_capability(<<"Admin-Rewrite-Commit">>) -> ?CAP_REWRITE_CONTENT;
+required_capability(<<"Board-Config">>) -> undefined; %% handled separately (admin or board-mod + cap)
 required_capability(<<"Self-Delete">>) -> undefined; %% handled separately
 required_capability(<<"Edit-Post">>) -> undefined; %% handled separately
 required_capability(<<"Priority-Report">>) -> undefined; %% handled separately
@@ -527,6 +580,10 @@ has_valid_privileged_payload(TX, <<"Cooldown-Bypass-Post">>) ->
 	has_nonempty_tag(TX, <<"Board-Id">>);
 has_valid_privileged_payload(TX, <<"Board">>) ->
 	has_nonempty_tag(TX, <<"Board-Name">>) andalso has_nonempty_tag(TX, <<"Board-Id">>);
+has_valid_privileged_payload(TX, <<"Board-Config">>) ->
+	has_nonempty_tag(TX, <<"Board-Id">>) andalso
+	has_nonempty_tag(TX, <<"Config-Key">>) andalso
+	lists:member(get_tag(TX, <<"Config-Key">>), ?VALID_BOARD_CONFIG_KEYS);
 has_valid_privileged_payload(TX, <<"Admin-Rewrite-Propose">>) ->
 	has_nonempty_tag(TX, <<"Target-TX">>) andalso
 	has_nonempty_tag(TX, <<"Target-Type">>) andalso
@@ -613,6 +670,18 @@ get_rewrite_reverse() ->
 	case ets:lookup(node_state, rewrite_reverse) of
 		[{rewrite_reverse, RR}] -> RR;
 		[] -> element(10, initial_state())
+	end.
+
+get_board_configs() ->
+	case ets:lookup(node_state, board_configs) of
+		[{board_configs, Configs}] -> Configs;
+		[] -> #{}
+	end.
+
+get_board_config(BoardId, Key) ->
+	Configs = get_board_configs(),
+	case maps:get(BoardId, Configs, #{}) of
+		BoardMap -> maps:get(Key, BoardMap, undefined)
 	end.
 
 is_board_closed(BoardId) ->
@@ -869,7 +938,8 @@ get_capabilities_for_address(Address, AdminAddresses, WalletRoles) ->
 	end.
 
 role_capabilities(?ROLE_ADMIN) ->
-	[?CAP_HIDE_POST, ?CAP_BAN_USER, ?CAP_MANAGE_ROLES, ?CAP_REWRITE_CONTENT];
+	[?CAP_HIDE_POST, ?CAP_BAN_USER, ?CAP_MANAGE_ROLES, ?CAP_REWRITE_CONTENT,
+	 ?CAP_CONFIGURE_BOARD];
 role_capabilities(?ROLE_MODERATOR) ->
 	[?CAP_HIDE_POST, ?CAP_BAN_USER];
 role_capabilities(?ROLE_BOARD_MODERATOR) ->
