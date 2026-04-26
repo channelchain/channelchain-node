@@ -1,19 +1,10 @@
 # =============================================
 # ChannelChain Node — 本番用 Multi-stage Build
 # =============================================
-# Stage 1: 依存取得 + コンパイル + リリース生成
-# Stage 2: 軽量ランタイムイメージ
-#
-# ビルド:
-#   docker build -f Dockerfile.prod -t channelchain-node .
-# =============================================
-
-# ── Stage 1: Builder ──
 FROM erlang:26 AS builder
 
 WORKDIR /build
 
-# OS 依存（NIF コンパイル用）
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake gcc g++ git make libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -22,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY rebar.config rebar.lock* ./
 RUN rebar3 get-deps || true
 
-# ソース全体をコピー（.dockerignore で不要ファイルを除外）
+# ソース全体をコピー
 COPY . .
 
 # クロスプラットフォーム対策: ホスト側のビルド成果物を除去
@@ -45,13 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# リリースをコピー
 COPY --from=builder /build/_build/prod/rel/arweave/ /app/
-
-# ジェネシス設定
 COPY config/genesis_block.json /app/config/genesis_block.json
-
-# entrypoint
 COPY entrypoint.prod.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 

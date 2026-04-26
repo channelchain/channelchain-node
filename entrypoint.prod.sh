@@ -77,7 +77,8 @@ if [ ! -f "$DATA_DIR/.initialized" ]; then
       data_dir "$DATA_DIR" \
       $STORAGE_MODULE_ARG \
       $MINING_ADDR_ARG \
-      $MINE_ARG
+      $MINE_ARG \
+      requests_per_minute_limit 100000
   else
     wait_for_peer
     echo "==> Joining ChannelChain network as PEER node: $NODE_NAME"
@@ -86,6 +87,7 @@ if [ ! -f "$DATA_DIR/.initialized" ]; then
       $STORAGE_MODULE_ARG \
       $MINING_ADDR_ARG \
       $MINE_ARG \
+      requests_per_minute_limit 100000 \
       $PEER_ARGS
   fi
 else
@@ -97,13 +99,15 @@ else
       start_from_latest_state \
       $STORAGE_MODULE_ARG \
       $MINING_ADDR_ARG \
-      $MINE_ARG
+      $MINE_ARG \
+      requests_per_minute_limit 100000
   else
     exec $RELEASE_DIR/arweave foreground \
       data_dir "$DATA_DIR" \
       $STORAGE_MODULE_ARG \
       $MINING_ADDR_ARG \
       $MINE_ARG \
+      requests_per_minute_limit 100000 \
       $PEER_ARGS
   fi
 fi
