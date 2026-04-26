@@ -2119,13 +2119,18 @@ handle_post_tx(Req, Peer, TX) ->
 		{invalid, invalid_data_root_size} ->
 			handle_post_tx_invalid_data_root_response();
 		{valid, TX2} ->
-			case ar_admin:validate_admin_tx(TX2) of
-				false ->
-					{error_response, {403, #{}, <<"Unauthorized admin transaction.">>}};
-				true ->
-					ar_data_sync:add_data_root_to_disk_pool(TX2#tx.data_root, TX2#tx.data_size,
-							TX#tx.id),
-					handle_post_tx_accepted(Req, TX, Peer)
+			case ar_bbs_validator:validate(TX2) of
+				{error, BbsReason} ->
+					{error_response, {400, #{}, BbsReason}};
+				ok ->
+					case ar_admin:validate_admin_tx(TX2) of
+						false ->
+							{error_response, {403, #{}, <<"Unauthorized admin transaction.">>}};
+						true ->
+							ar_data_sync:add_data_root_to_disk_pool(TX2#tx.data_root, TX2#tx.data_size,
+									TX#tx.id),
+							handle_post_tx_accepted(Req, TX, Peer)
+					end
 			end
 	end.
 
