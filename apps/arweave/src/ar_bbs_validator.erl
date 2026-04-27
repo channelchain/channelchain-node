@@ -2,6 +2,7 @@
 %%
 %% ChannelChain BBS 固有の TX バリデーション。
 %% TX 受信時にデータサイズ・JSON形式・必須タグを検証し、不正TXを拒否する。
+%% Board-Config (ETS) の設定値を参照し、板ごとの制限を適用する。
 
 -module(ar_bbs_validator).
 
@@ -9,22 +10,32 @@
 
 -include_lib("arweave/include/ar.hrl").
 
-%% ── サイズ制限 ──
--define(MAX_POST_BODY, 10000).       %% 投稿本文: 10,000文字
--define(MAX_POST_LINES, 200).        %% 投稿本文: 200行
--define(MAX_POST_NAME, 30).          %% 投稿者名: 30文字
--define(MAX_THREAD_TITLE, 100).      %% スレタイ: 100文字
--define(MAX_BOARD_NAME, 50).         %% 板名: 50文字
--define(MAX_BOARD_DESC, 200).        %% 板説明: 200文字
--define(MAX_PROFILE_NAME, 30).       %% プロフィール名: 30文字
--define(MAX_PROFILE_BIO, 500).       %% プロフィールBio: 500文字
--define(MAX_DATA_SIZE, 32768).       %% TX data 最大サイズ (32KB)
+%% ── ハード上限（Board-Config でこれを超えることはできない） ──
+-define(HARD_MAX_POST_BODY, 10000).
+-define(HARD_MAX_POST_LINES, 200).
+-define(HARD_MAX_POST_NAME, 60).
+-define(HARD_MAX_THREAD_TITLE, 200).
+-define(HARD_MAX_BOARD_NAME, 100).
+-define(HARD_MAX_BOARD_DESC, 500).
+-define(HARD_MAX_PROFILE_NAME, 60).
+-define(HARD_MAX_PROFILE_BIO, 1000).
+-define(HARD_MAX_DATA_SIZE, 32768).
+
+%% ── デフォルト値（Board-Config 未設定時） ──
+-define(DEFAULT_MAX_POST_BODY, 10000).
+-define(DEFAULT_MAX_POST_LINES, 200).
+-define(DEFAULT_MAX_POST_NAME, 30).
+-define(DEFAULT_MAX_THREAD_TITLE, 100).
+-define(DEFAULT_MAX_BOARD_NAME, 50).
+-define(DEFAULT_MAX_BOARD_DESC, 200).
+-define(DEFAULT_MAX_PROFILE_NAME, 30).
+-define(DEFAULT_MAX_PROFILE_BIO, 500).
 
 %% @doc ChannelChain TX を検証する。
 %% 戻り値: ok | {error, Reason}
 validate(TX) ->
 	case ar_admin:is_channelchain_tx(TX) of
-		false -> ok; %% ChannelChain TX でなければスキップ
+		false -> ok;
 		true -> validate_channelchain_tx(TX)
 	end.
 
@@ -45,7 +56,7 @@ validate_channelchain_tx(TX) ->
 
 %% ── データサイズ検証 ──
 validate_data_size(TX) ->
-	case TX#tx.data_size > ?MAX_DATA_SIZE of
+	case TX#tx.data_size > ?HARD_MAX_DATA_SIZE of
 		true -> {error, <<"TX data too large">>};
 		false -> ok
 	end.
@@ -61,7 +72,7 @@ validate_required_tags(TX, <<"Report">>) ->
 	require_tags(TX, [<<"Target-TX">>, <<"Reason">>]);
 validate_required_tags(TX, <<"Priority-Report">>) ->
 	require_tags(TX, [<<"Target-TX">>, <<"Reason">>]);
-validate_required_tags(TX, <<"Profile">>) ->
+validate_required_tags(_TX, <<"Profile">>) ->
 	ok;
 validate_required_tags(TX, <<"Board-Config">>) ->
 	require_tags(TX, [<<"Board-Id">>, <<"Config-Key">>]);
@@ -76,20 +87,23 @@ require_tags(TX, [Tag | Rest]) ->
 		_ -> require_tags(TX, Rest)
 	end.
 
-%% ── データ内容検証 ──
+%% ── データ内容検証（Board-Config 参照） ──
 validate_data_content(TX, <<"Post">>) ->
+	BoardId = get_tag(TX, <<"Board-Id">>),
+	MaxBody = get_board_limit(BoardId, <<"max_body_bytes">>, ?DEFAULT_MAX_POST_BODY, ?HARD_MAX_POST_BODY),
+	MaxName = get_board_limit(BoardId, <<"max_name_bytes">>, ?DEFAULT_MAX_POST_NAME, ?HARD_MAX_POST_NAME),
 	case parse_json_data(TX) of
 		{error, _} = E -> E;
 		{ok, Json} ->
 			Body = maps:get(<<"body">>, Json, <<>>),
 			Name = maps:get(<<"name">>, Json, <<>>),
-			case validate_string_length(Body, ?MAX_POST_BODY) of
+			case validate_string_length(Body, MaxBody) of
 				{error, _} -> {error, <<"Post body too long">>};
 				ok ->
-					case validate_line_count(Body, ?MAX_POST_LINES) of
+					case validate_line_count(Body, ?HARD_MAX_POST_LINES) of
 						{error, _} -> {error, <<"Post body too many lines">>};
 						ok ->
-							case validate_string_length(Name, ?MAX_POST_NAME) of
+							case validate_string_length(Name, MaxName) of
 								{error, _} -> {error, <<"Post name too long">>};
 								ok -> ok
 							end
@@ -97,20 +111,22 @@ validate_data_content(TX, <<"Post">>) ->
 			end
 	end;
 validate_data_content(TX, <<"Thread">>) ->
+	BoardId = get_tag(TX, <<"Board-Id">>),
+	MaxTitle = get_board_limit(BoardId, <<"max_title_bytes">>, ?DEFAULT_MAX_THREAD_TITLE, ?HARD_MAX_THREAD_TITLE),
 	Title = get_tag(TX, <<"Thread-Title">>),
-	case validate_string_length(Title, ?MAX_THREAD_TITLE) of
+	case validate_string_length(Title, MaxTitle) of
 		{error, _} -> {error, <<"Thread title too long">>};
 		ok -> ok
 	end;
 validate_data_content(TX, <<"Board">>) ->
 	Name = get_tag(TX, <<"Board-Name">>),
 	Desc = get_tag(TX, <<"Description">>),
-	case validate_string_length(Name, ?MAX_BOARD_NAME) of
+	case validate_string_length(Name, ?HARD_MAX_BOARD_NAME) of
 		{error, _} -> {error, <<"Board name too long">>};
 		ok ->
 			case Desc of
 				undefined -> ok;
-				_ -> case validate_string_length(Desc, ?MAX_BOARD_DESC) of
+				_ -> case validate_string_length(Desc, ?HARD_MAX_BOARD_DESC) of
 					{error, _} -> {error, <<"Board description too long">>};
 					ok -> ok
 				end
@@ -122,10 +138,10 @@ validate_data_content(TX, <<"Profile">>) ->
 		{ok, Json} ->
 			DisplayName = maps:get(<<"displayName">>, Json, <<>>),
 			Bio = maps:get(<<"bio">>, Json, <<>>),
-			case validate_string_length(DisplayName, ?MAX_PROFILE_NAME) of
+			case validate_string_length(DisplayName, ?HARD_MAX_PROFILE_NAME) of
 				{error, _} -> {error, <<"Profile name too long">>};
 				ok ->
-					case validate_string_length(Bio, ?MAX_PROFILE_BIO) of
+					case validate_string_length(Bio, ?HARD_MAX_PROFILE_BIO) of
 						{error, _} -> {error, <<"Profile bio too long">>};
 						ok -> ok
 					end
@@ -134,12 +150,29 @@ validate_data_content(TX, <<"Profile">>) ->
 validate_data_content(_TX, _Type) ->
 	ok.
 
+%% ── Board-Config からの制限値取得 ──
+%% Board-Config の値 > 0 かつ HardMax 以下ならその値を使う。
+%% それ以外はデフォルト値を使う。
+get_board_limit(undefined, _Key, Default, _HardMax) -> Default;
+get_board_limit(BoardId, Key, Default, HardMax) ->
+	case ar_admin:get_board_config(BoardId, Key) of
+		undefined -> Default;
+		ValBin ->
+			try
+				Val = binary_to_integer(ValBin),
+				case Val > 0 andalso Val =< HardMax of
+					true -> Val;
+					false -> Default
+				end
+			catch _:_ -> Default
+			end
+	end.
+
 %% ── ヘルパー ──
 get_tag(TX, TagName) ->
 	case lists:keyfind(TagName, 1, TX#tx.tags) of
 		{TagName, Value} -> Value;
 		false ->
-			%% base64url エンコードされたタグも検索
 			get_tag_decoded(TX#tx.tags, TagName)
 	end.
 
@@ -168,7 +201,6 @@ parse_json_data(TX) ->
 
 validate_string_length(undefined, _Max) -> ok;
 validate_string_length(Bin, Max) when is_binary(Bin) ->
-	%% UTF-8 文字数でカウント
 	Len = string:length(unicode:characters_to_list(Bin)),
 	case Len > Max of
 		true -> {error, <<"String too long">>};
