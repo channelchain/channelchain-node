@@ -562,7 +562,7 @@ download_txs(Peers, B, TXRoot) ->
 			]),
 			{error, txs_count_exceeds_limit};
 		{error, tx_not_found} ->
-			?LOG_WARNING([
+			?LOG_DEBUG([
 				{event, ar_header_sync_block_tx_not_found},
 				{block, ar_util:encode(B#block.indep_hash)}
 			]),

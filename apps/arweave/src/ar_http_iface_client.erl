@@ -1236,7 +1236,7 @@ get_tx_from_remote_peer(Peer, TXID, RatePeer) ->
 		{ok, #tx{} = TX, Time, Size} ->
 			case ar_tx:verify_tx_id(TXID, TX) of
 				false ->
-					?LOG_WARNING([
+					?LOG_DEBUG([
 						{event, peer_served_invalid_tx},
 						{peer, ar_util:format_peer(Peer)},
 						{tx, ar_util:encode(TXID)}
