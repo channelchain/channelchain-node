@@ -4002,7 +4002,15 @@ get_data_roots_for_offset(Offset) ->
 		true ->
 			{error, not_found};
 		false ->
-			{BlockStart, BlockEnd, TXRoot} = ar_block_index:get_block_bounds(Offset),
+			case catch ar_block_index:get_block_bounds(Offset) of
+				{BlockStart, BlockEnd, TXRoot} when is_integer(BlockStart) ->
+					get_data_roots_for_offset_inner(Offset, BlockStart, BlockEnd, TXRoot);
+				_ ->
+					{error, not_found}
+			end
+	end.
+
+get_data_roots_for_offset_inner(Offset, BlockStart, BlockEnd, TXRoot) ->
 			true = Offset >= BlockStart andalso Offset < BlockEnd,
 			StoreID = ?DEFAULT_MODULE,
 			DB = {data_root_offset_index, StoreID},
@@ -4023,8 +4031,7 @@ get_data_roots_for_offset(Offset) ->
 						[],
 						DataRootIndexKeySet
 					))}}
-			end
-	end.
+			end.
 
 %% @doc Return true if the data roots for the given block range are synced, false otherwise.
 %% Assert the given BlockEnd and TXRoot match the stored values.
