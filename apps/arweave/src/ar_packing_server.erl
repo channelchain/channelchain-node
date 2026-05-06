@@ -464,14 +464,14 @@ init_packing_state() ->
 	PackingState = {RandomXState512, RandomXState4096, RandomXStateSharedEntropy},
 	ets:insert(?MODULE, {randomx_packing_state, PackingState}),
 	%% ChannelChain: also initialize real RandomX state for post-fork use.
+	%% Only rx512 (spora_2_6) is initialized — rx4096/rxsquared not used by this chain
+	%% (no composite or replica_2_9 storage modules), saves ~6GB RAM.
 	case ar_fork:height_randomx_switch() of
 		infinity ->
 			ok;
 		_ ->
 			RealState512 = ar_mine_randomx:init_fast_real(rx512, ?RANDOMX_PACKING_KEY, Schedulers),
-			RealState4096 = ar_mine_randomx:init_fast_real(rx4096, ?RANDOMX_PACKING_KEY, Schedulers),
-			RealStateEntropy = ar_mine_randomx:init_fast_real(rxsquared, ?RANDOMX_PACKING_KEY, Schedulers),
-			RealPackingState = {RealState512, RealState4096, RealStateEntropy},
+			RealPackingState = {RealState512, not_initialized, not_initialized},
 			ets:insert(?MODULE, {randomx_real_packing_state, RealPackingState})
 	end,
 	PackingState.
