@@ -16,7 +16,7 @@
 %% The mainnet name. Does not change at the hard forks.
 -ifndef(NETWORK_NAME).
 	-ifdef(AR_TEST).
-		-define(NETWORK_NAME, "arweave.localtest").
+		-define(NETWORK_NAME, "channelchain.mainnet.1").
 	-else.
 		-define(NETWORK_NAME, "arweave.N.1").
 	-endif.
@@ -25,7 +25,7 @@
 %% When a request is received without specifing the X-Network header, this network name
 %% is assumed.
 -ifndef(DEFAULT_NETWORK_NAME).
-	-define(DEFAULT_NETWORK_NAME, "arweave.N.1").
+	-define(DEFAULT_NETWORK_NAME, "channelchain.mainnet.1").
 -endif.
 
 %% The current release number of the arweave client software.
