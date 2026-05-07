@@ -16,12 +16,18 @@ RUN rebar3 get-deps || true
 # ソース全体をコピー
 COPY . .
 
-# クロスプラットフォーム対策: ホスト側のビルド成果物を除去
+# クロスプラットフォーム対策: ホスト側のビルド成果物を除去 + arch 自動判定
+# x86_64 と aarch64 の両方をサポート (Hetzner / Oracle Cloud Free Tier 用)
 RUN find apps/arweave/lib -name '*.o' -o -name '*.a' -o -name '*.so' | xargs rm -f 2>/dev/null; \
     find apps/arweave/c_src -name '*.o' -o -name '*.a' | xargs rm -f 2>/dev/null; \
     rm -f apps/arweave/priv/*.so; \
     cd apps/arweave/lib/openssl-sha-lite && make clean 2>/dev/null; \
-    perl Configure linux-x86_64 no-shared no-threads no-asm -fPIC 2>/dev/null || true
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then \
+      perl Configure linux-aarch64 no-shared no-threads no-asm -fPIC; \
+    else \
+      perl Configure linux-x86_64 no-shared no-threads no-asm -fPIC; \
+    fi
 
 # コンパイル + リリース生成
 RUN rebar3 as prod release
