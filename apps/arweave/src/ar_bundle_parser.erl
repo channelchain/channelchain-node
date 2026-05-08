@@ -1,0 +1,214 @@
+%%% @doc ANS-104 binary bundle parser.
+%%%
+%%% Decodes an ANS-104 v2.0.0 bundle binary into a list of #bundle_item{}.
+%%% This is part of the ChannelChain L2 bundle settlement work
+%%% (see docs/l2-bundle-chain-spec.md, Phase A1).
+%%%
+%%% A1 scope: structural decoding only.
+%%%   - Item-level signature / PoW verification: deferred to ar_bundle_verify (Phase B).
+%%%   - Avro tag decoding: deferred to A2 — tag bytes are kept raw in this phase.
+%%%   - deepHash cross-check vs arweave-js: deferred to A3.
+%%%
+%%% Bundle binary layout (Bundle-Version 2.0.0):
+%%%   [ N : u256 LE (32 bytes)                ]   item count
+%%%   [ entries : N * 64 bytes                ]   each = (size : u256 LE) || (id : 32 bytes)
+%%%   [ items : concatenation of N items      ]   each item is `size` bytes
+%%%
+%%% Each item layout:
+%%%   [ signature_type : u16 LE (2 bytes)     ]
+%%%   [ signature      : sig_len bytes        ]
+%%%   [ owner          : owner_len bytes      ]
+%%%   [ target_marker  : 1 byte (0x00 / 0x01) ]
+%%%   [ target         : 32 bytes (if marker=0x01) ]
+%%%   [ anchor_marker  : 1 byte (0x00 / 0x01) ]
+%%%   [ anchor         : 32 bytes (if marker=0x01) ]
+%%%   [ tag_count      : u64 LE (8 bytes)     ]
+%%%   [ tag_bytes_size : u64 LE (8 bytes)     ]
+%%%   [ tag_bytes      : tag_bytes_size bytes ]
+%%%   [ data           : remaining bytes      ]
+
+-module(ar_bundle_parser).
+
+-export([parse/1, item_id/1]).
+-export_type([bundle_item/0]).
+
+-record(bundle_item, {
+    id              :: binary(),     %% 32 bytes
+    signature_type  :: pos_integer(),
+    signature       :: binary(),
+    owner           :: binary(),
+    target          :: binary() | undefined,
+    anchor          :: binary() | undefined,
+    tag_count       :: non_neg_integer(),
+    tag_bytes       :: binary(),     %% raw Avro-encoded tags (decoded in A2)
+    data            :: binary()
+}).
+
+-type bundle_item() :: #bundle_item{}.
+
+%% Hard limits (mirrors docs/l2-bundle-chain-spec.md §6).
+-define(MAX_ITEMS_PER_BUNDLE, 256).
+-define(MAX_BUNDLE_DATA_SIZE, 1048576).   %% 1 MiB
+-define(MAX_ITEM_DATA_SIZE,   32768).     %% 32 KiB
+
+%% Signature type → (signature length, owner length).
+%% Reference: ANS-104 §"Signature types".
+%% Only type 1 (Arweave RSA-PSS 4096) is required for ChannelChain;
+%% other types are accepted structurally so that future expansion does
+%% not require parser changes.
+sig_layout(1) -> {512, 512};   %% Arweave RSA-PSS 4096
+sig_layout(2) -> {64, 32};     %% Ed25519
+sig_layout(3) -> {65, 65};     %% Ethereum secp256k1
+sig_layout(4) -> {64, 32};     %% Solana Ed25519
+sig_layout(_) -> unknown.
+
+%% @doc Parse an ANS-104 v2.0.0 bundle binary.
+%% Returns {ok, [bundle_item()]} on success, {error, Reason} on malformed input.
+-spec parse(binary()) -> {ok, [bundle_item()]} | {error, term()}.
+parse(Bin) when is_binary(Bin) ->
+    Size = byte_size(Bin),
+    if
+        Size > ?MAX_BUNDLE_DATA_SIZE ->
+            {error, {bundle_too_large, Size}};
+        Size < 32 ->
+            {error, bundle_truncated_header};
+        true ->
+            parse_header(Bin)
+    end;
+parse(_) ->
+    {error, not_binary}.
+
+parse_header(<<NBin:32/binary, Rest/binary>>) ->
+    case decode_u256_le(NBin) of
+        N when N > ?MAX_ITEMS_PER_BUNDLE ->
+            {error, {too_many_items, N}};
+        0 ->
+            case Rest of
+                <<>> -> {ok, []};
+                _    -> {error, trailing_bytes_after_zero_count}
+            end;
+        N when byte_size(Rest) < N * 64 ->
+            {error, entry_table_truncated};
+        N ->
+            EntryBytes = N * 64,
+            <<EntryTableBin:EntryBytes/binary, ItemsBin/binary>> = Rest,
+            case parse_entries(EntryTableBin, []) of
+                {error, _} = E -> E;
+                {ok, Entries}  -> parse_items(Entries, ItemsBin, [])
+            end
+    end.
+
+parse_entries(<<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_entries(<<SizeBin:32/binary, IdBin:32/binary, Rest/binary>>, Acc) ->
+    Size = decode_u256_le(SizeBin),
+    parse_entries(Rest, [{Size, IdBin} | Acc]).
+
+parse_items([], <<>>, Acc) ->
+    {ok, lists:reverse(Acc)};
+parse_items([], _Trailing, _Acc) ->
+    {error, trailing_bytes_after_items};
+parse_items([{Size, _Id} | _], Bin, _Acc) when byte_size(Bin) < Size ->
+    {error, item_payload_truncated};
+parse_items([{Size, ExpectedId} | Rest], Bin, Acc) ->
+    <<ItemBin:Size/binary, MoreBin/binary>> = Bin,
+    case decode_item(ItemBin, ExpectedId) of
+        {error, _} = E -> E;
+        {ok, Item}     -> parse_items(Rest, MoreBin, [Item | Acc])
+    end.
+
+decode_item(<<SigTypeLE:2/binary, Body0/binary>>, ExpectedId) ->
+    SigType = decode_u16_le(SigTypeLE),
+    case sig_layout(SigType) of
+        unknown ->
+            {error, {unknown_signature_type, SigType}};
+        {SigLen, OwnerLen} ->
+            case Body0 of
+                <<Sig:SigLen/binary, Owner:OwnerLen/binary, Body1/binary>> ->
+                    case decode_optional_32(Body1) of
+                        {error, _} = E -> E;
+                        {Target, Body2} ->
+                            case decode_optional_32(Body2) of
+                                {error, _} = E -> E;
+                                {Anchor, Body3} ->
+                                    decode_tags_and_data(SigType, Sig, Owner,
+                                        Target, Anchor, Body3, ExpectedId)
+                            end
+                    end;
+                _ ->
+                    {error, item_sig_or_owner_truncated}
+            end
+    end;
+decode_item(_, _) ->
+    {error, item_header_truncated}.
+
+decode_optional_32(<<0:8, Rest/binary>>) ->
+    {undefined, Rest};
+decode_optional_32(<<1:8, V:32/binary, Rest/binary>>) ->
+    {V, Rest};
+decode_optional_32(_) ->
+    {error, optional_field_truncated}.
+
+decode_tags_and_data(SigType, Sig, Owner, Target, Anchor, Body, ExpectedId) ->
+    case Body of
+        <<TagCountLE:8/binary, TagBytesSizeLE:8/binary, Rest0/binary>> ->
+            TagCount = decode_u64_le(TagCountLE),
+            TagBytesSize = decode_u64_le(TagBytesSizeLE),
+            case Rest0 of
+                <<TagBytes:TagBytesSize/binary, Data/binary>> ->
+                    DataSize = byte_size(Data),
+                    if
+                        DataSize > ?MAX_ITEM_DATA_SIZE ->
+                            {error, {item_data_too_large, DataSize}};
+                        true ->
+                            ComputedId = item_id_from_signature(Sig),
+                            case ComputedId of
+                                ExpectedId ->
+                                    {ok, #bundle_item{
+                                        id = ComputedId,
+                                        signature_type = SigType,
+                                        signature = Sig,
+                                        owner = Owner,
+                                        target = Target,
+                                        anchor = Anchor,
+                                        tag_count = TagCount,
+                                        tag_bytes = TagBytes,
+                                        data = Data
+                                    }};
+                                _ ->
+                                    {error, {item_id_mismatch, ExpectedId, ComputedId}}
+                            end
+                    end;
+                _ ->
+                    {error, tag_bytes_truncated}
+            end;
+        _ ->
+            {error, tag_header_truncated}
+    end.
+
+%% @doc Standard ANS-104 ItemID = SHA-256(signature).
+%% (ChannelChain anonymous-item override is handled in ar_bundle_verify;
+%% during parsing, the ID we compare against is always the spec-defined one
+%% so that bundles produced by standard tooling are recognised.)
+-spec item_id(bundle_item()) -> binary().
+item_id(#bundle_item{signature = Sig}) ->
+    item_id_from_signature(Sig).
+
+item_id_from_signature(Sig) ->
+    crypto:hash(sha256, Sig).
+
+%% Little-endian unsigned integer decoders.
+%% ANS-104 fields are byte-reversed relative to most Erlang big-endian patterns,
+%% so we decode by reversing then matching as big-endian.
+decode_u16_le(<<A, B>>) ->
+    <<V:16/big-unsigned-integer>> = <<B, A>>,
+    V.
+
+decode_u64_le(<<B0, B1, B2, B3, B4, B5, B6, B7>>) ->
+    <<V:64/big-unsigned-integer>> = <<B7, B6, B5, B4, B3, B2, B1, B0>>,
+    V.
+
+decode_u256_le(Bin) when byte_size(Bin) =:= 32 ->
+    Reversed = list_to_binary(lists:reverse(binary_to_list(Bin))),
+    <<V:256/big-unsigned-integer>> = Reversed,
+    V.
