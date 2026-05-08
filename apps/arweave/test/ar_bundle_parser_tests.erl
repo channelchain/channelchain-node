@@ -130,6 +130,93 @@ item_id_mismatch_test() ->
                  ar_bundle_parser:parse(Bin)).
 
 %%%-------------------------------------------------------------------
+%%% A2: Avro tag decoding
+%%%-------------------------------------------------------------------
+
+decode_tags_empty_test() ->
+    ?assertEqual({ok, []}, ar_bundle_parser:decode_tags(<<>>)),
+    ?assertEqual({ok, []}, ar_bundle_parser:decode_tags(<<0>>)).
+
+decode_tags_single_block_test() ->
+    Tags = [{<<"App-Name">>, <<"ChannelChain">>},
+            {<<"Type">>, <<"Post">>}],
+    Bin  = avro_tags(Tags),
+    ?assertEqual({ok, Tags}, ar_bundle_parser:decode_tags(Bin)).
+
+decode_tags_utf8_test() ->
+    %% Tag values may contain UTF-8 sequences (e.g., post body in name tag).
+    Tags = [{<<"Name">>, <<"名無しさん"/utf8>>}],
+    Bin  = avro_tags(Tags),
+    ?assertEqual({ok, Tags}, ar_bundle_parser:decode_tags(Bin)).
+
+decode_tags_multi_block_test() ->
+    %% Two positive-count blocks back-to-back, terminated by 0.
+    R1 = avro_record(<<"a">>, <<"1">>),
+    R2 = avro_record(<<"b">>, <<"2">>),
+    Bin = <<(avro_long(1))/binary, R1/binary,
+            (avro_long(1))/binary, R2/binary,
+            (avro_long(0))/binary>>,
+    ?assertEqual({ok, [{<<"a">>, <<"1">>}, {<<"b">>, <<"2">>}]},
+                 ar_bundle_parser:decode_tags(Bin)).
+
+decode_tags_negative_count_block_test() ->
+    %% Negative count carries a byte-size hint; we honor the records
+    %% by absolute count and accept (but do not enforce) the size.
+    R1 = avro_record(<<"k">>, <<"v">>),
+    Bin = <<(avro_long(-1))/binary,             %% count = -1
+            (avro_long(byte_size(R1)))/binary,   %% block byte size
+            R1/binary,
+            (avro_long(0))/binary>>,
+    ?assertEqual({ok, [{<<"k">>, <<"v">>}]},
+                 ar_bundle_parser:decode_tags(Bin)).
+
+decode_tags_truncated_string_test() ->
+    %% String length declares 5 bytes but only 2 are present.
+    Bad = <<(avro_long(1))/binary,        %% 1 record
+            (avro_long(5))/binary,        %% name len
+            "ab",                          %% truncated payload
+            (avro_long(0))/binary>>,
+    ?assertMatch({error, string_truncated},
+                 ar_bundle_parser:decode_tags(Bad)).
+
+decode_tags_truncated_varint_test() ->
+    %% Continuation bit set but no following byte.
+    ?assertMatch({error, varint_truncated},
+                 ar_bundle_parser:decode_tags(<<16#80>>)).
+
+%%%-------------------------------------------------------------------
+%%% Tag-aware item integration
+%%%-------------------------------------------------------------------
+
+item_with_tags_round_trips_test() ->
+    Sig    = filled(?SIG_LEN, $A),
+    Owner  = filled(?OWNER_LEN, $B),
+    Tags   = [{<<"App-Name">>, <<"ChannelChain">>},
+              {<<"Type">>, <<"Post">>}],
+    TagBytes = avro_tags(Tags),
+    {ItemBin, ItemId} = build_item(?SIGTYPE_ARWEAVE, Sig, Owner,
+                                   undefined, undefined,
+                                   length(Tags), TagBytes, <<"hi">>),
+    Bundle = build_bundle([{ItemBin, ItemId}]),
+
+    {ok, [Item]} = ar_bundle_parser:parse(Bundle),
+    ?assertEqual(Tags,     item_field(tags, Item)),
+    ?assertEqual(TagBytes, item_field(tag_bytes, Item)),
+    ?assertEqual(2,        item_field(tag_count, Item)).
+
+tag_count_mismatch_test() ->
+    %% Header advertises 2 tags but encoded array carries only 1.
+    Sig    = filled(?SIG_LEN, $A),
+    Owner  = filled(?OWNER_LEN, $B),
+    OneTag = avro_tags([{<<"k">>, <<"v">>}]),
+    {ItemBin, ItemId} = build_item(?SIGTYPE_ARWEAVE, Sig, Owner,
+                                   undefined, undefined,
+                                   2, OneTag, <<"x">>),
+    Bundle = build_bundle([{ItemBin, ItemId}]),
+    ?assertMatch({error, {tag_count_mismatch, 2, 1}},
+                 ar_bundle_parser:parse(Bundle)).
+
+%%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
 
@@ -176,9 +263,33 @@ build_bundle(Items) ->
 %% Mirrors the field order in ar_bundle_parser.erl.
 item_field(Field, Tuple) ->
     Names = [id, signature_type, signature, owner, target, anchor,
-             tag_count, tag_bytes, data],
+             tag_count, tag_bytes, tags, data],
     Index = lookup(Field, Names, 2),  %% +1 for record tag
     element(Index, Tuple).
 
 lookup(Field, [Field | _], Idx) -> Idx;
 lookup(Field, [_ | Rest], Idx)  -> lookup(Field, Rest, Idx + 1).
+
+%%% --- Avro encoding helpers (for tag fixtures) ---
+
+zigzag_enc(N) when N >= 0 -> N * 2;
+zigzag_enc(N) when N <  0 -> -N * 2 - 1.
+
+varint_enc(N) when N >= 0, N < 128 -> <<N>>;
+varint_enc(N) when N >= 128 ->
+    Lo = N band 16#7F,
+    Hi = N bsr 7,
+    <<(Lo bor 16#80), (varint_enc(Hi))/binary>>.
+
+avro_long(N) -> varint_enc(zigzag_enc(N)).
+
+avro_string(Bin) ->
+    <<(avro_long(byte_size(Bin)))/binary, Bin/binary>>.
+
+avro_record(Name, Value) ->
+    <<(avro_string(Name))/binary, (avro_string(Value))/binary>>.
+
+%% Single-block array followed by 0 end marker.
+avro_tags(Tags) ->
+    Records = << <<(avro_record(N, V))/binary>> || {N, V} <- Tags >>,
+    <<(avro_long(length(Tags)))/binary, Records/binary, (avro_long(0))/binary>>.

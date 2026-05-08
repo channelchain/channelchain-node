@@ -29,8 +29,10 @@
 
 -module(ar_bundle_parser).
 
--export([parse/1, item_id/1]).
--export_type([bundle_item/0]).
+-export([parse/1, item_id/1, decode_tags/1]).
+-export_type([bundle_item/0, tag/0]).
+
+-type tag() :: {Name :: binary(), Value :: binary()}.
 
 -record(bundle_item, {
     id              :: binary(),     %% 32 bytes
@@ -40,7 +42,8 @@
     target          :: binary() | undefined,
     anchor          :: binary() | undefined,
     tag_count       :: non_neg_integer(),
-    tag_bytes       :: binary(),     %% raw Avro-encoded tags (decoded in A2)
+    tag_bytes       :: binary(),     %% raw Avro bytes (kept for deepHash)
+    tags            :: [tag()],
     data            :: binary()
 }).
 
@@ -161,29 +164,40 @@ decode_tags_and_data(SigType, Sig, Owner, Target, Anchor, Body, ExpectedId) ->
                         DataSize > ?MAX_ITEM_DATA_SIZE ->
                             {error, {item_data_too_large, DataSize}};
                         true ->
-                            ComputedId = item_id_from_signature(Sig),
-                            case ComputedId of
-                                ExpectedId ->
-                                    {ok, #bundle_item{
-                                        id = ComputedId,
-                                        signature_type = SigType,
-                                        signature = Sig,
-                                        owner = Owner,
-                                        target = Target,
-                                        anchor = Anchor,
-                                        tag_count = TagCount,
-                                        tag_bytes = TagBytes,
-                                        data = Data
-                                    }};
-                                _ ->
-                                    {error, {item_id_mismatch, ExpectedId, ComputedId}}
-                            end
+                            finalize_item(SigType, Sig, Owner, Target, Anchor,
+                                          TagCount, TagBytes, Data, ExpectedId)
                     end;
                 _ ->
                     {error, tag_bytes_truncated}
             end;
         _ ->
             {error, tag_header_truncated}
+    end.
+
+finalize_item(SigType, Sig, Owner, Target, Anchor, TagCount, TagBytes, Data, ExpectedId) ->
+    case decode_tags(TagBytes) of
+        {error, _} = E -> E;
+        {ok, Tags} when length(Tags) =/= TagCount ->
+            {error, {tag_count_mismatch, TagCount, length(Tags)}};
+        {ok, Tags} ->
+            ComputedId = item_id_from_signature(Sig),
+            case ComputedId of
+                ExpectedId ->
+                    {ok, #bundle_item{
+                        id = ComputedId,
+                        signature_type = SigType,
+                        signature = Sig,
+                        owner = Owner,
+                        target = Target,
+                        anchor = Anchor,
+                        tag_count = TagCount,
+                        tag_bytes = TagBytes,
+                        tags = Tags,
+                        data = Data
+                    }};
+                _ ->
+                    {error, {item_id_mismatch, ExpectedId, ComputedId}}
+            end
     end.
 
 %% @doc Standard ANS-104 ItemID = SHA-256(signature).
@@ -212,3 +226,89 @@ decode_u256_le(Bin) when byte_size(Bin) =:= 32 ->
     Reversed = list_to_binary(lists:reverse(binary_to_list(Bin))),
     <<V:256/big-unsigned-integer>> = Reversed,
     V.
+
+%%%-------------------------------------------------------------------
+%%% Avro tag decoding
+%%%
+%%% Tag encoding per ANS-104 (Avro Array of Record{name, value}):
+%%%   array  := block* end
+%%%   block  := count (records) | -count block_size (records)
+%%%   end    := 0           (zigzag varint)
+%%%   record := name_string value_string
+%%%   string := length:zigzag-varint  utf8_bytes
+%%%
+%%% A negative count signals a block whose total byte size follows; we
+%%% accept and ignore the size hint, recovering the records by their
+%%% absolute count.
+%%%-------------------------------------------------------------------
+
+%% @doc Decode an Avro-encoded tag block into [{Name, Value}, ...].
+-spec decode_tags(binary()) -> {ok, [tag()]} | {error, term()}.
+decode_tags(<<>>) ->
+    {ok, []};
+decode_tags(Bin) ->
+    decode_tag_blocks(Bin, []).
+
+decode_tag_blocks(Bin, Acc) ->
+    case decode_zigzag_varint(Bin) of
+        {error, _} = E -> E;
+        {0, Rest} ->
+            case Rest of
+                <<>> -> {ok, lists:reverse(Acc)};
+                _    -> {error, trailing_bytes_after_tag_end}
+            end;
+        {Count, Rest0} when Count > 0 ->
+            case decode_tag_records(Count, Rest0, Acc) of
+                {error, _} = E -> E;
+                {ok, NewAcc, Rest1} -> decode_tag_blocks(Rest1, NewAcc)
+            end;
+        {Count, Rest0} when Count < 0 ->
+            case decode_zigzag_varint(Rest0) of
+                {error, _} = E -> E;
+                {_BlockBytes, Rest1} ->
+                    case decode_tag_records(-Count, Rest1, Acc) of
+                        {error, _} = E -> E;
+                        {ok, NewAcc, Rest2} -> decode_tag_blocks(Rest2, NewAcc)
+                    end
+            end
+    end.
+
+decode_tag_records(0, Rest, Acc) ->
+    {ok, Acc, Rest};
+decode_tag_records(N, Bin, Acc) when N > 0 ->
+    case decode_avro_string(Bin) of
+        {error, _} = E -> E;
+        {Name, Rest0} ->
+            case decode_avro_string(Rest0) of
+                {error, _} = E -> E;
+                {Value, Rest1} ->
+                    decode_tag_records(N - 1, Rest1, [{Name, Value} | Acc])
+            end
+    end.
+
+decode_avro_string(Bin) ->
+    case decode_zigzag_varint(Bin) of
+        {error, _} = E -> E;
+        {Len, _} when Len < 0 -> {error, negative_string_length};
+        {Len, Rest} ->
+            case Rest of
+                <<S:Len/binary, More/binary>> -> {S, More};
+                _ -> {error, string_truncated}
+            end
+    end.
+
+%% Avro long: zigzag-encoded variable-length integer (LSB-first 7-bit groups).
+decode_zigzag_varint(Bin) ->
+    decode_varint(Bin, 0, 0).
+
+decode_varint(<<0:1, Group:7, Rest/binary>>, Shift, Acc) ->
+    Raw = Acc bor (Group bsl Shift),
+    {zigzag_to_signed(Raw), Rest};
+decode_varint(<<1:1, Group:7, Rest/binary>>, Shift, Acc) ->
+    NewAcc = Acc bor (Group bsl Shift),
+    decode_varint(Rest, Shift + 7, NewAcc);
+decode_varint(<<>>, _, _) ->
+    {error, varint_truncated}.
+
+zigzag_to_signed(N) ->
+    (N bsr 1) bxor -(N band 1).
