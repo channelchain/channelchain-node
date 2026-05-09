@@ -126,7 +126,7 @@ item_id_mismatch_test() ->
     Header  = u256_le(1),
     Entry   = <<(u256_le(byte_size(ItemBin)))/binary, WrongId/binary>>,
     Bin     = <<Header/binary, Entry/binary, ItemBin/binary>>,
-    ?assertMatch({error, {item_id_mismatch, _, _}},
+    ?assertMatch({error, {item_id_mismatch, signed, _, _}},
                  ar_bundle_parser:parse(Bin)).
 
 %%%-------------------------------------------------------------------
@@ -275,6 +275,94 @@ fixture_path(Name) ->
     end.
 
 %%%-------------------------------------------------------------------
+%%% B0: anonymous-aware parsing (ChannelChain extension)
+%%%
+%%% docs/l2-bundle-chain-spec.md §2-2 (B):
+%%%   anonymous = signature_type=1
+%%%             + owner == ZERO_OWNER (512 × 0x00)
+%%%             + signature == ZERO_SIG (512 × 0x00)
+%%%             + PoW-Nonce tag present
+%%%   AnonItemID = SHA-256(deepHash(item))
+%%%   Partial-zero asymmetry → reject (parser-level structural error).
+%%%-------------------------------------------------------------------
+
+-define(ZERO_OWNER, binary:copy(<<0>>, 512)).
+-define(ZERO_SIG,   binary:copy(<<0>>, 512)).
+
+anonymous_item_parses_test() ->
+    Tags = [{<<"App-Name">>, <<"ChannelChain">>},
+            {<<"Type">>, <<"Post">>},
+            {<<"PoW-Nonce">>, <<"42">>}],
+    TagBytes = avro_tags(Tags),
+    Data = <<"hello-anon">>,
+    AnonId = compute_anon_id(?ZERO_OWNER, undefined, undefined,
+                             TagBytes, Data),
+    {ItemBin, _SigBasedId} = build_item(?SIGTYPE_ARWEAVE, ?ZERO_SIG,
+                                        ?ZERO_OWNER, undefined,
+                                        undefined, length(Tags),
+                                        TagBytes, Data),
+    Bundle = build_bundle([{ItemBin, AnonId}]),
+    {ok, [Item]} = ar_bundle_parser:parse(Bundle),
+    ?assertEqual(anonymous, item_field(kind, Item)),
+    ?assertEqual(AnonId,    item_field(id, Item)),
+    ?assertEqual(true,      ar_bundle_parser:is_anonymous(Item)).
+
+%% U8b: entry table id of an anonymous item uses the wrong rule
+%% (SHA-256 of zero signature). Parser must reject — the legitimate
+%% AnonItemID will not match.
+anonymous_entry_id_mismatch_test() ->
+    Tags = [{<<"PoW-Nonce">>, <<"1">>}],
+    TagBytes = avro_tags(Tags),
+    {ItemBin, SigBasedId} = build_item(?SIGTYPE_ARWEAVE, ?ZERO_SIG,
+                                       ?ZERO_OWNER, undefined,
+                                       undefined, length(Tags),
+                                       TagBytes, <<"x">>),
+    Bundle = build_bundle([{ItemBin, SigBasedId}]),
+    ?assertMatch({error, {item_id_mismatch, anonymous, _, _}},
+                 ar_bundle_parser:parse(Bundle)).
+
+%% U8c.1: owner == ZERO but signature non-zero → reject.
+partial_zero_owner_only_test() ->
+    Sig = filled(?SIG_LEN, $S),         %% non-zero
+    Tags = [{<<"PoW-Nonce">>, <<"1">>}],
+    TagBytes = avro_tags(Tags),
+    {ItemBin, ItemId} = build_item(?SIGTYPE_ARWEAVE, Sig, ?ZERO_OWNER,
+                                   undefined, undefined,
+                                   length(Tags), TagBytes, <<"x">>),
+    Bundle = build_bundle([{ItemBin, ItemId}]),
+    ?assertMatch({error, partial_zero_owner_only},
+                 ar_bundle_parser:parse(Bundle)).
+
+%% U8c.2: signature == ZERO but owner non-zero → reject.
+partial_zero_signature_only_test() ->
+    Owner = filled(?OWNER_LEN, $O),     %% non-zero
+    Tags = [{<<"PoW-Nonce">>, <<"1">>}],
+    TagBytes = avro_tags(Tags),
+    {ItemBin, ItemId} = build_item(?SIGTYPE_ARWEAVE, ?ZERO_SIG, Owner,
+                                   undefined, undefined,
+                                   length(Tags), TagBytes, <<"x">>),
+    Bundle = build_bundle([{ItemBin, ItemId}]),
+    ?assertMatch({error, partial_zero_signature_only},
+                 ar_bundle_parser:parse(Bundle)).
+
+%% U8c.3: ZERO_OWNER + ZERO_SIG but no PoW-Nonce tag → reject.
+anonymous_missing_pow_nonce_test() ->
+    Tags = [{<<"App-Name">>, <<"ChannelChain">>}],   %% no PoW-Nonce
+    TagBytes = avro_tags(Tags),
+    {ItemBin, SigBasedId} = build_item(?SIGTYPE_ARWEAVE, ?ZERO_SIG, ?ZERO_OWNER,
+                                       undefined, undefined,
+                                       length(Tags), TagBytes, <<"x">>),
+    Bundle = build_bundle([{ItemBin, SigBasedId}]),
+    ?assertMatch({error, anonymous_missing_pow_nonce},
+                 ar_bundle_parser:parse(Bundle)).
+
+signed_item_kind_test() ->
+    %% Sanity: existing arbundles fixture parses as kind=signed.
+    BundleBin = read_fixture("bundle_v2.bin"),
+    {ok, Items} = ar_bundle_parser:parse(BundleBin),
+    [?assertEqual(signed, item_field(kind, I)) || I <- Items].
+
+%%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
 
@@ -320,13 +408,26 @@ build_bundle(Items) ->
 %% Cross-module field accessor (avoids leaking the record into tests).
 %% Mirrors the field order in ar_bundle_parser.erl.
 item_field(Field, Tuple) ->
-    Names = [id, signature_type, signature, owner, target, anchor,
+    Names = [id, kind, signature_type, signature, owner, target, anchor,
              tag_count, tag_bytes, tags, data],
     Index = lookup(Field, Names, 2),  %% +1 for record tag
     element(Index, Tuple).
 
 lookup(Field, [Field | _], Idx) -> Idx;
 lookup(Field, [_ | Rest], Idx)  -> lookup(Field, Rest, Idx + 1).
+
+%%% --- AnonItemID computation (mirrors parser logic) ---
+
+compute_anon_id(Owner, Target, Anchor, TagBytes, Data) ->
+    DH = ar_deep_hash:hash([
+        <<"dataitem">>, <<"1">>, <<"1">>,
+        Owner,
+        case Target of undefined -> <<>>; _ -> Target end,
+        case Anchor of undefined -> <<>>; _ -> Anchor end,
+        TagBytes,
+        Data
+    ]),
+    crypto:hash(sha256, DH).
 
 %%% --- Avro encoding helpers (for tag fixtures) ---
 

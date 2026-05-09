@@ -29,13 +29,16 @@
 
 -module(ar_bundle_parser).
 
--export([parse/1, item_id/1, decode_tags/1]).
--export_type([bundle_item/0, tag/0]).
+-export([parse/1, item_id/1, decode_tags/1, is_anonymous/1]).
+-export_type([bundle_item/0, tag/0, item_kind/0]).
 
 -type tag() :: {Name :: binary(), Value :: binary()}.
 
+-type item_kind() :: signed | anonymous.
+
 -record(bundle_item, {
     id              :: binary(),     %% 32 bytes
+    kind            :: item_kind(),
     signature_type  :: pos_integer(),
     signature       :: binary(),
     owner           :: binary(),
@@ -180,33 +183,91 @@ finalize_item(SigType, Sig, Owner, Target, Anchor, TagCount, TagBytes, Data, Exp
         {ok, Tags} when length(Tags) =/= TagCount ->
             {error, {tag_count_mismatch, TagCount, length(Tags)}};
         {ok, Tags} ->
-            ComputedId = item_id_from_signature(Sig),
-            case ComputedId of
-                ExpectedId ->
-                    {ok, #bundle_item{
-                        id = ComputedId,
-                        signature_type = SigType,
-                        signature = Sig,
-                        owner = Owner,
-                        target = Target,
-                        anchor = Anchor,
-                        tag_count = TagCount,
-                        tag_bytes = TagBytes,
-                        tags = Tags,
-                        data = Data
-                    }};
-                _ ->
-                    {error, {item_id_mismatch, ExpectedId, ComputedId}}
+            case classify_item(SigType, Sig, Owner, Target, Anchor, TagBytes, Data, Tags) of
+                {error, _} = E -> E;
+                {Kind, ComputedId} ->
+                    case ComputedId of
+                        ExpectedId ->
+                            {ok, #bundle_item{
+                                id = ComputedId,
+                                kind = Kind,
+                                signature_type = SigType,
+                                signature = Sig,
+                                owner = Owner,
+                                target = Target,
+                                anchor = Anchor,
+                                tag_count = TagCount,
+                                tag_bytes = TagBytes,
+                                tags = Tags,
+                                data = Data
+                            }};
+                        _ ->
+                            {error, {item_id_mismatch, Kind, ExpectedId, ComputedId}}
+                    end
             end
     end.
 
-%% @doc Standard ANS-104 ItemID = SHA-256(signature).
-%% (ChannelChain anonymous-item override is handled in ar_bundle_verify;
-%% during parsing, the ID we compare against is always the spec-defined one
-%% so that bundles produced by standard tooling are recognised.)
+%% Classify the item as signed / anonymous, or reject as malformed.
+%%
+%% Anonymous (per docs/l2-bundle-chain-spec.md §2-2 (B)):
+%%   signature_type == 1
+%%   owner          == 512 × 0x00
+%%   signature      == 512 × 0x00
+%%   PoW-Nonce tag present
+%% All four conditions must hold simultaneously. Partial-zero asymmetry
+%% (only owner zero, only signature zero, missing PoW-Nonce) is rejected
+%% so we never silently treat half-anonymous items as signed.
+classify_item(SigType, Sig, Owner, Target, Anchor, TagBytes, Data, Tags) ->
+    OwnerZero = is_zero_bytes(Owner),
+    SigZero   = is_zero_bytes(Sig),
+    PowNonce  = lists:keymember(<<"PoW-Nonce">>, 1, Tags),
+    case {OwnerZero, SigZero, SigType, PowNonce} of
+        {true, true, 1, true} ->
+            {anonymous, anon_item_id(SigType, Owner, Target, Anchor, TagBytes, Data)};
+        {true, true, 1, false} ->
+            {error, anonymous_missing_pow_nonce};
+        {true, true, _Other, _} ->
+            {error, {anonymous_wrong_signature_type, SigType}};
+        {true, false, _, _} ->
+            {error, partial_zero_owner_only};
+        {false, true, _, _} ->
+            {error, partial_zero_signature_only};
+        {false, false, _, _} ->
+            {signed, item_id_from_signature(Sig)}
+    end.
+
+is_zero_bytes(Bin) when is_binary(Bin) ->
+    Size = byte_size(Bin),
+    Size > 0 andalso Bin =:= binary:copy(<<0>>, Size).
+
+%% AnonItemID = SHA-256(deepHash(item)) per §2-4.
+%% deepHash inputs follow the ANS-104 list verified in A3.
+anon_item_id(SigType, Owner, Target, Anchor, TagBytes, Data) ->
+    DeepHash = ar_deep_hash:hash([
+        <<"dataitem">>,
+        <<"1">>,
+        integer_to_binary(SigType),
+        Owner,
+        target_or_empty(Target),
+        target_or_empty(Anchor),
+        TagBytes,
+        Data
+    ]),
+    crypto:hash(sha256, DeepHash).
+
+target_or_empty(undefined) -> <<>>;
+target_or_empty(Bin) when is_binary(Bin) -> Bin.
+
+%% @doc Whether the parsed item is the ChannelChain anonymous variant.
+-spec is_anonymous(bundle_item()) -> boolean().
+is_anonymous(#bundle_item{kind = anonymous}) -> true;
+is_anonymous(#bundle_item{kind = signed})    -> false.
+
+%% @doc The ItemID this parser used to validate the entry table.
+%%   - signed item:    SHA-256(signature)            (standard ANS-104)
+%%   - anonymous item: SHA-256(deepHash(item))       (ChannelChain extension)
 -spec item_id(bundle_item()) -> binary().
-item_id(#bundle_item{signature = Sig}) ->
-    item_id_from_signature(Sig).
+item_id(#bundle_item{id = Id}) -> Id.
 
 item_id_from_signature(Sig) ->
     crypto:hash(sha256, Sig).
