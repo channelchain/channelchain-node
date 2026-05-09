@@ -11,8 +11,13 @@
 
 %% The number of block index elements to fetch per request.
 %% Must not exceed ?MAX_BLOCK_INDEX_RANGE_SIZE defined in ar_http_iface_middleware.erl.
+%% ChannelChain runs production with AR_TEST defined for adjusted PoW parameters,
+%% so we can't use upstream's tiny "2 per request" test value -- a fresh peer
+%% joining a chain at height 10000+ would need 5000 round-trips and the gun
+%% HTTP/2 client tends to drop the connection partway through. Use 1000, which
+%% exercises pagination in tests while remaining usable for real joins.
 -ifdef(AR_TEST).
--define(REQUEST_BLOCK_INDEX_RANGE_SIZE, 2).
+-define(REQUEST_BLOCK_INDEX_RANGE_SIZE, 1000).
 -else.
 -define(REQUEST_BLOCK_INDEX_RANGE_SIZE, 10000).
 -endif.

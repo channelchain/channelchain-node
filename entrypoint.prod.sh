@@ -3,14 +3,14 @@
 DATA_DIR="/data"
 RELEASE_DIR="/app/bin"
 
-# ピアリストを引数に変換
+# ピアリストを引数に変換 (peer = discovery, local_peer = trusted for join)
 PEER_ARGS=""
 FIRST_PEER_HOST=""
 FIRST_PEER_PORT=""
 if [ -n "$PEERS" ]; then
   IFS=',' read -ra PEER_LIST <<< "$PEERS"
   for peer in "${PEER_LIST[@]}"; do
-    PEER_ARGS="$PEER_ARGS peer $peer"
+    PEER_ARGS="$PEER_ARGS peer $peer local_peer $peer"
   done
   FIRST_PEER="${PEER_LIST[0]}"
   FIRST_PEER_HOST="${FIRST_PEER%%:*}"
