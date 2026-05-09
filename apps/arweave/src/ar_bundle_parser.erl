@@ -32,24 +32,10 @@
 -export([parse/1, item_id/1, decode_tags/1, is_anonymous/1]).
 -export_type([bundle_item/0, tag/0, item_kind/0]).
 
+-include_lib("arweave/include/ar_bundle.hrl").
+
 -type tag() :: {Name :: binary(), Value :: binary()}.
-
 -type item_kind() :: signed | anonymous.
-
--record(bundle_item, {
-    id              :: binary(),     %% 32 bytes
-    kind            :: item_kind(),
-    signature_type  :: pos_integer(),
-    signature       :: binary(),
-    owner           :: binary(),
-    target          :: binary() | undefined,
-    anchor          :: binary() | undefined,
-    tag_count       :: non_neg_integer(),
-    tag_bytes       :: binary(),     %% raw Avro bytes (kept for deepHash)
-    tags            :: [tag()],
-    data            :: binary()
-}).
-
 -type bundle_item() :: #bundle_item{}.
 
 %% Hard limits (mirrors docs/l2-bundle-chain-spec.md §6).
