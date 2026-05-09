@@ -76,11 +76,32 @@
 
 %% @doc ChannelChain TX を検証する。
 %% 戻り値: ok | {error, Reason}
+%%
+%% Type=Bundle (ANS-104 carrier) は ar_bundle_validator に委譲する。
+%% その内部で各 item は pseudo TX 化されて再度 ar_bbs_validator:validate/1
+%% に通るため、ChannelChain 標準の tag / data 制約は各 item に強制される。
 validate(TX) ->
 	case ar_admin:is_channelchain_tx(TX) of
 		false -> ok;
-		true -> validate_channelchain_tx(TX)
+		true ->
+			case is_bundle_tx(TX) of
+				true  -> validate_bundle_carrier(TX);
+				false -> validate_channelchain_tx(TX)
+			end
 	end.
+
+is_bundle_tx(TX) ->
+	get_tag(TX, <<"Type">>) =:= <<"Bundle">>.
+
+validate_bundle_carrier(TX) ->
+	case ar_bundle_validator:validate_bundle(TX) of
+		{ok, _PseudoTXs} -> ok;
+		{error, Reason}  -> {error, format_bundle_error(Reason)}
+	end.
+
+format_bundle_error(Reason) when is_binary(Reason) -> Reason;
+format_bundle_error(Reason) ->
+	iolist_to_binary(io_lib:format("Bundle rejected: ~p", [Reason])).
 
 validate_channelchain_tx(TX) ->
 	Type = get_tag(TX, <<"Type">>),
