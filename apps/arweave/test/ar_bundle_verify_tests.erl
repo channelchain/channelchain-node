@@ -98,6 +98,61 @@ anonymous_pow_missing_nonce_tag_defensive_test() ->
                  ar_bundle_verify:verify_item(Item, [{difficulty, 4}])).
 
 %%%-------------------------------------------------------------------
+%%% B3: carrier Bundle-PoW
+%%%-------------------------------------------------------------------
+
+%% U9: a freshly mined carrier nonce passes verify_carrier_pow.
+carrier_pow_valid_test_() ->
+    {timeout, 30, fun carrier_pow_valid/0}.
+
+carrier_pow_valid() ->
+    BundleBin = read_fixture("bundle_v2.bin"),
+    Difficulty = 12,
+    Nonce = mine_carrier_pow(BundleBin, Difficulty),
+    ?assertEqual(ok, ar_bundle_verify:verify_carrier_pow(BundleBin, Nonce, Difficulty)).
+
+%% A trivially wrong nonce fails.
+carrier_pow_invalid_nonce_test() ->
+    BundleBin = read_fixture("bundle_v2.bin"),
+    ?assertMatch({error, bad_carrier_pow},
+                 ar_bundle_verify:verify_carrier_pow(BundleBin, <<"0">>, 12)).
+
+%% Difficulty threshold: a nonce that satisfies low difficulty must
+%% NOT verify at a higher difficulty.
+carrier_pow_difficulty_threshold_test_() ->
+    {timeout, 30, fun carrier_pow_difficulty_threshold/0}.
+
+carrier_pow_difficulty_threshold() ->
+    BundleBin = read_fixture("bundle_v2.bin"),
+    Low  = 8,
+    High = 24,
+    Nonce = mine_carrier_pow(BundleBin, Low),
+    ?assertEqual(ok, ar_bundle_verify:verify_carrier_pow(BundleBin, Nonce, Low)),
+    ?assertMatch({error, bad_carrier_pow},
+                 ar_bundle_verify:verify_carrier_pow(BundleBin, Nonce, High)).
+
+%% A nonce mined WITHOUT the domain separator must not satisfy verify.
+%% This guards against accidentally regressing the domain-separator
+%% step, which would silently accept hashes from a different scheme.
+carrier_pow_domain_separator_required_test_() ->
+    {timeout, 30, fun carrier_pow_domain_separator_required/0}.
+
+carrier_pow_domain_separator_required() ->
+    BundleBin = read_fixture("bundle_v2.bin"),
+    Difficulty = 12,
+    NaiveNonce = mine_naive_pow(BundleBin, Difficulty),
+    %% The naive nonce satisfies SHA-256(bundle || nonce) but not
+    %% SHA-256(domain || bundle || nonce). With overwhelming
+    %% probability the latter does not have the same leading-zero
+    %% pattern, so verify must reject it.
+    ?assertMatch({error, bad_carrier_pow},
+                 ar_bundle_verify:verify_carrier_pow(BundleBin, NaiveNonce, Difficulty)).
+
+domain_separator_value_test() ->
+    ?assertEqual(<<"channelchain-bundle-pow-v1">>,
+                 ar_bundle_verify:carrier_pow_domain()).
+
+%%%-------------------------------------------------------------------
 %%% deep_hash/1 cross-check vs A3 fixture
 %%%-------------------------------------------------------------------
 
@@ -112,9 +167,12 @@ deep_hash_matches_fixture_test() ->
 %%%-------------------------------------------------------------------
 
 parsed_fixture_items() ->
-    {ok, BundleBin} = file:read_file(fixture_path("bundle_v2.bin")),
-    {ok, Items} = ar_bundle_parser:parse(BundleBin),
+    {ok, Items} = ar_bundle_parser:parse(read_fixture("bundle_v2.bin")),
     Items.
+
+read_fixture(Name) ->
+    {ok, Bin} = file:read_file(fixture_path(Name)),
+    Bin.
 
 fixture_path(Name) ->
     case filelib:is_file(filename:join(["test", "fixtures", Name])) of
@@ -171,4 +229,36 @@ mine_pow_loop(Data, Difficulty, N) ->
     case ar_bundle_verify:check_leading_zeros(Hash, Difficulty) of
         true  -> Nonce;
         false -> mine_pow_loop(Data, Difficulty, N + 1)
+    end.
+
+%%% --- Carrier PoW mining ---
+
+mine_carrier_pow(BundleBin, Difficulty) when Difficulty =< 16 ->
+    Domain = ar_bundle_verify:carrier_pow_domain(),
+    mine_carrier_loop(Domain, BundleBin, Difficulty, 0).
+
+mine_carrier_loop(_Dom, _Bin, _D, N) when N > 1_000_000 ->
+    erlang:error({carrier_mine_exhausted, N});
+mine_carrier_loop(Domain, BundleBin, Difficulty, N) ->
+    Nonce = integer_to_binary(N),
+    Hash = crypto:hash(sha256, <<Domain/binary, BundleBin/binary, Nonce/binary>>),
+    case ar_bundle_verify:check_leading_zeros(Hash, Difficulty) of
+        true  -> Nonce;
+        false -> mine_carrier_loop(Domain, BundleBin, Difficulty, N + 1)
+    end.
+
+%% Mine a nonce against SHA-256(BundleBin || nonce) — i.e. *without*
+%% the domain separator. Used solely to prove that verify rejects such
+%% hashes.
+mine_naive_pow(BundleBin, Difficulty) when Difficulty =< 16 ->
+    mine_naive_loop(BundleBin, Difficulty, 0).
+
+mine_naive_loop(_Bin, _D, N) when N > 1_000_000 ->
+    erlang:error({naive_mine_exhausted, N});
+mine_naive_loop(BundleBin, Difficulty, N) ->
+    Nonce = integer_to_binary(N),
+    Hash = crypto:hash(sha256, <<BundleBin/binary, Nonce/binary>>),
+    case ar_bundle_verify:check_leading_zeros(Hash, Difficulty) of
+        true  -> Nonce;
+        false -> mine_naive_loop(BundleBin, Difficulty, N + 1)
     end.

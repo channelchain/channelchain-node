@@ -19,10 +19,24 @@
 %%%     ar_pow_verify:get_difficulty_for_board(Board-Id-tag-value).
 %%%     verify_item/2 accepts {difficulty, N} so unit tests do not
 %%%     depend on the live ETS difficulty cache.
+%%%
+%%% Carrier-bundle PoW (B3, §2-3):
+%%%   SHA-256("channelchain-bundle-pow-v1" || bundle_bin || nonce)
+%%%     must have `Difficulty` leading zero bits.
+%%%   - bundle_bin is the carrier TX's `data` field — the entire
+%%%     ANS-104 binary (item count + entry table + items).
+%%%   - The "channelchain-bundle-pow-v1" domain separator namespaces
+%%%     this hash so future v2 reissues can cleanly diverge.
+%%%   - Difficulty is the `bundle_pow_difficulty` config knob
+%%%     (default 24) — distinct from per-item PoW difficulty.
 
 -module(ar_bundle_verify).
 
--export([verify_item/1, verify_item/2, deep_hash/1, check_leading_zeros/2]).
+-export([verify_item/1, verify_item/2,
+         verify_carrier_pow/3,
+         deep_hash/1,
+         check_leading_zeros/2,
+         carrier_pow_domain/0]).
 
 -include_lib("arweave/include/ar_bundle.hrl").
 
@@ -30,6 +44,9 @@
 -define(ARWEAVE_RSA_EXPONENT, <<1, 0, 1>>).   %% 65537, big-endian
 -define(ARWEAVE_RSA_DIGEST,    sha256).
 -define(ARWEAVE_RSA_SALT_LEN,  -2).            %% auto / max — matches Node.js default
+
+%% Domain separator for carrier-level PoW. See §2-3.
+-define(CARRIER_POW_DOMAIN, <<"channelchain-bundle-pow-v1">>).
 
 %% @doc Verify an item parsed by ar_bundle_parser:parse/1.
 %% In production this resolves the PoW difficulty for anonymous items
@@ -137,3 +154,25 @@ check_leading_zeros(<<Byte:8, _/binary>>, Bits) when Bits > 0 ->
     (Byte band Mask) =:= 0;
 check_leading_zeros(<<>>, _Bits) ->
     false.
+
+%%%-------------------------------------------------------------------
+%%% Carrier-bundle PoW (§2-3)
+%%%-------------------------------------------------------------------
+
+%% @doc Domain-separated SHA-256 PoW over the raw carrier-TX data.
+%% Hash = SHA-256(domain || bundle_bin || nonce); the leading
+%% `Difficulty` bits must be zero.
+-spec verify_carrier_pow(binary(), binary(), non_neg_integer())
+        -> ok | {error, bad_carrier_pow}.
+verify_carrier_pow(BundleBin, Nonce, Difficulty)
+        when is_binary(BundleBin), is_binary(Nonce), is_integer(Difficulty) ->
+    Hash = crypto:hash(sha256,
+        <<?CARRIER_POW_DOMAIN/binary, BundleBin/binary, Nonce/binary>>),
+    case check_leading_zeros(Hash, Difficulty) of
+        true  -> ok;
+        false -> {error, bad_carrier_pow}
+    end.
+
+%% @doc Exposed for tests / future v2 reissue planning.
+-spec carrier_pow_domain() -> binary().
+carrier_pow_domain() -> ?CARRIER_POW_DOMAIN.
