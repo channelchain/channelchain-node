@@ -14,7 +14,11 @@
 
 -export([start_link/0, add_tx/1, add_confirmed_tx/1, query/1, is_deleted/1, is_rewritten/1,
          resolve_effective_tx/1, get_replacement_tx/1,
-         board_stats/1, thread_stats/1, is_build_index_complete/0]).
+         board_stats/1, thread_stats/1, is_build_index_complete/0,
+         is_seen_item/1, bundle_of_item/1]).
+%% Internal but exposed for tests so callers can exercise the bundle
+%% expansion path without spinning up the gen_server.
+-export([maybe_index_tx/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
@@ -27,6 +31,8 @@
 -define(REWRITTEN_TXS_TABLE, channelchain_rewritten_txs). %% {OldTXID, ReplacementTXID}
 -define(STATE_TABLE, channelchain_index_state). %% Build-state flags consumed by callers
 %% e.g. ar_http_iface_client's tombstone trust gate
+-define(SEEN_ITEMS_TABLE, channelchain_seen_items).         %% ItemID → first-seen ts (ms)
+-define(BUNDLE_OF_ITEM_TABLE, channelchain_bundle_of_item). %% ItemID → carrier TXID
 -define(APP_NAME, <<"ChannelChain">>).
 
 %%%===================================================================
@@ -89,6 +95,18 @@ get_replacement_tx(TXID) ->
         [] -> undefined
     end.
 
+%% @doc Has this bundle item ID already been accepted from any bundle?
+-spec is_seen_item(binary()) -> boolean().
+is_seen_item(ItemID) -> ets:member(?SEEN_ITEMS_TABLE, ItemID).
+
+%% @doc Reverse lookup: which carrier bundle TX delivered this item?
+-spec bundle_of_item(binary()) -> binary() | undefined.
+bundle_of_item(ItemID) ->
+    case ets:lookup(?BUNDLE_OF_ITEM_TABLE, ItemID) of
+        [{ItemID, CarrierID}] -> CarrierID;
+        []                    -> undefined
+    end.
+
 %% @doc Get stats (thread_count, post_count) for a board, filtering deleted/closed.
 board_stats(BoardId) ->
     gen_server:call(?MODULE, {board_stats, BoardId}, 10000).
@@ -114,6 +132,10 @@ init([]) ->
     ets:new(?REWRITTEN_TXS_TABLE,
         [set, public, named_table, {read_concurrency, true}]),
     ets:new(?STATE_TABLE,
+        [set, public, named_table, {read_concurrency, true}]),
+    ets:new(?SEEN_ITEMS_TABLE,
+        [set, public, named_table, {read_concurrency, true}]),
+    ets:new(?BUNDLE_OF_ITEM_TABLE,
         [set, public, named_table, {read_concurrency, true}]),
     %% Subscribe to tx events (new TX received by node)
     ar_events:subscribe(tx),
@@ -232,79 +254,118 @@ terminate(_Reason, _State) ->
 
 %% @doc Index a TX if it belongs to the ChannelChain app.
 %% Status: confirmed | unconfirmed. Deletion/rewrite effects only apply when confirmed.
+%% Bundle carriers (Type=Bundle) are expanded into one pseudo TX per item;
+%% each pseudo TX is indexed via the regular path so downstream queries
+%% cannot tell bundle-derived posts apart from directly-submitted ones.
 maybe_index_tx(TX, Status) when is_record(TX, tx) ->
     Tags = TX#tx.tags,
     case get_tag_value(Tags, <<"App-Name">>) of
         ?APP_NAME ->
-            TXID = TX#tx.id,
-            Type = get_tag_value(Tags, <<"Type">>),
-
-            %% Deletion and rewrite effects only on confirmed TXs
-            case Status of
-                confirmed ->
-                    %% If it's a deletion TX, mark the target as deleted
-                    IsDeleteType = (Type =:= <<"Admin-Delete">> orelse
-                                   Type =:= <<"Moderator-Hide">> orelse
-                                   Type =:= <<"Board-Moderator-Hide">> orelse
-                                   Type =:= <<"Self-Delete">>),
-                    case IsDeleteType of
-                        true ->
-                            case get_tag_value(Tags, <<"Target-TX">>) of
-                                undefined -> ok;
-                                TargetTXID ->
-                                    ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true}),
-                                    case Type of
-                                        <<"Admin-Delete">> ->
-                                            %% Target-TX is base64url-encoded;
-                                            %% blacklist expects raw binary.
-                                            case catch ar_util:decode(TargetTXID) of
-                                                Decoded when is_binary(Decoded),
-                                                             byte_size(Decoded) =:= 32 ->
-                                                    ar_tx_blacklist:blacklist_txs([Decoded]);
-                                                _ ->
-                                                    ?LOG_WARNING([{event,
-                                                            channelchain_admin_delete_bad_target},
-                                                            {target, TargetTXID}])
-                                            end;
-                                        _ ->
-                                            ok
-                                    end
-                            end;
-                        false ->
-                            ok
-                    end,
-                    %% If it's a rewrite commit TX, map old TX → replacement TX
-                    case Type of
-                        <<"Admin-Rewrite-Commit">> ->
-                            OldTxId = get_tag_value(Tags, <<"Target-TX">>),
-                            NewTxId = get_tag_value(Tags, <<"Replacement-TX">>),
-                            case OldTxId =/= undefined andalso NewTxId =/= undefined of
-                                true -> ets:insert(?REWRITTEN_TXS_TABLE, {OldTxId, NewTxId});
-                                false -> ok
-                            end;
-                        _ ->
-                            ok
-                    end;
-                unconfirmed ->
-                    ok
-            end,
-
-            %% Store {txid, tags}
-            ets:insert(?TX_TAGS_TABLE, {TXID, Tags}),
-            %% Store full TX record for privileged TXs (needed by ar_admin state rebuild)
-            case ar_admin:is_admin_tx(TX) of
-                true -> ets:insert(?TX_RECORDS_TABLE, {TXID, TX});
-                false -> ok
-            end,
-            %% Build inverted index: {TagName, TagValue, TXID}
-            lists:foreach(fun({Name, Value}) ->
-                ets:insert(?TX_INDEX_TABLE, {{Name, Value}, TXID})
-            end, Tags);
+            case get_tag_value(Tags, <<"Type">>) of
+                <<"Bundle">> -> index_bundle_tx(TX, Status);
+                _            -> index_single_tx(TX, Status)
+            end;
         _ ->
             ok
     end;
 maybe_index_tx(_, _) ->
     ok.
+
+index_single_tx(TX, Status) ->
+    Tags = TX#tx.tags,
+    TXID = TX#tx.id,
+    Type = get_tag_value(Tags, <<"Type">>),
+
+    %% Deletion and rewrite effects only on confirmed TXs
+    case Status of
+        confirmed ->
+            %% If it's a deletion TX, mark the target as deleted
+            IsDeleteType = (Type =:= <<"Admin-Delete">> orelse
+                           Type =:= <<"Moderator-Hide">> orelse
+                           Type =:= <<"Board-Moderator-Hide">> orelse
+                           Type =:= <<"Self-Delete">>),
+            case IsDeleteType of
+                true ->
+                    case get_tag_value(Tags, <<"Target-TX">>) of
+                        undefined -> ok;
+                        TargetTXID ->
+                            ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true}),
+                            case Type of
+                                <<"Admin-Delete">> ->
+                                    %% Target-TX is base64url-encoded;
+                                    %% blacklist expects raw binary.
+                                    case catch ar_util:decode(TargetTXID) of
+                                        Decoded when is_binary(Decoded),
+                                                     byte_size(Decoded) =:= 32 ->
+                                            ar_tx_blacklist:blacklist_txs([Decoded]);
+                                        _ ->
+                                            ?LOG_WARNING([{event,
+                                                    channelchain_admin_delete_bad_target},
+                                                    {target, TargetTXID}])
+                                    end;
+                                _ ->
+                                    ok
+                            end
+                    end;
+                false ->
+                    ok
+            end,
+            %% If it's a rewrite commit TX, map old TX → replacement TX
+            case Type of
+                <<"Admin-Rewrite-Commit">> ->
+                    OldTxId = get_tag_value(Tags, <<"Target-TX">>),
+                    NewTxId = get_tag_value(Tags, <<"Replacement-TX">>),
+                    case OldTxId =/= undefined andalso NewTxId =/= undefined of
+                        true -> ets:insert(?REWRITTEN_TXS_TABLE, {OldTxId, NewTxId});
+                        false -> ok
+                    end;
+                _ ->
+                    ok
+            end;
+        unconfirmed ->
+            ok
+    end,
+
+    %% Store {txid, tags}
+    ets:insert(?TX_TAGS_TABLE, {TXID, Tags}),
+    %% Store full TX record for privileged TXs (needed by ar_admin state rebuild)
+    case ar_admin:is_admin_tx(TX) of
+        true -> ets:insert(?TX_RECORDS_TABLE, {TXID, TX});
+        false -> ok
+    end,
+    %% Build inverted index: {TagName, TagValue, TXID}
+    lists:foreach(fun({Name, Value}) ->
+        ets:insert(?TX_INDEX_TABLE, {{Name, Value}, TXID})
+    end, Tags).
+
+%% Expand a bundle carrier TX into pseudo TXs and index each.
+%% Validation has already happened upstream (ar_bbs_validator →
+%% ar_bundle_validator) so we trust the binary at this point and only
+%% need to parse it.
+index_bundle_tx(CarrierTX, Status) ->
+    case ar_bundle_parser:parse(CarrierTX#tx.data) of
+        {ok, Items} ->
+            CarrierID = CarrierTX#tx.id,
+            lists:foreach(fun(Item) ->
+                ItemID = ar_bundle_parser:item_id(Item),
+                case ets:lookup(?SEEN_ITEMS_TABLE, ItemID) of
+                    [] ->
+                        ets:insert(?SEEN_ITEMS_TABLE,
+                                   {ItemID, erlang:system_time(millisecond)}),
+                        ets:insert(?BUNDLE_OF_ITEM_TABLE, {ItemID, CarrierID}),
+                        PseudoTX = ar_bundle_validator:item_to_pseudo_tx(Item),
+                        index_single_tx(PseudoTX, Status);
+                    _ ->
+                        %% De-dup: same ItemID already accepted from
+                        %% an earlier bundle, ignore.
+                        ok
+                end
+            end, Items);
+        {error, _} ->
+            %% Should not happen post-validation; tolerate gracefully
+            %% (e.g. corrupted block re-import).
+            ok
+    end.
 
 %% @doc Remove a TX from the index.
 %% Also cleans up deletion markers and TX records created by the removed TX.
