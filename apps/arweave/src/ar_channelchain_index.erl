@@ -17,8 +17,8 @@
          board_stats/1, thread_stats/1, is_build_index_complete/0,
          is_seen_item/1, bundle_of_item/1]).
 %% Internal but exposed for tests so callers can exercise the bundle
-%% expansion path without spinning up the gen_server.
--export([maybe_index_tx/2]).
+%% expansion / orphan paths without spinning up the gen_server.
+-export([maybe_index_tx/2, unindex_carrier/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
@@ -224,8 +224,13 @@ handle_info({event, block, {new, B, _Source}}, State) ->
     {noreply, State};
 
 handle_info({event, block, {orphaned, B}}, State) ->
-    %% On orphan: remove TXs from the index
+    %% On orphan: remove TXs from the index. Each TXID may be either
+    %% a bundle carrier (in which case all of its expanded items need
+    %% to be unindexed) or a regular TX. unindex_carrier/1 is a no-op
+    %% when the TXID has no items mapped to it, so calling both is
+    %% safe and uniform.
     lists:foreach(fun(TXID) ->
+        unindex_carrier(TXID),
         remove_tx(TXID)
     end, B#block.txs),
     {noreply, State};
@@ -406,6 +411,24 @@ remove_tx(TXID) ->
                 ets:delete_object(?TX_INDEX_TABLE, {{Name, Value}, TXID})
             end, Tags)
     end.
+
+%% @doc Reverse-lookup all bundle items whose carrier is `CarrierID`
+%% and unindex each one. Removes per-item tag entries from the
+%% regular tables and the bundle bookkeeping (SEEN_ITEMS,
+%% BUNDLE_OF_ITEM). No-op when no items map to CarrierID.
+-spec unindex_carrier(binary()) -> ok.
+unindex_carrier(CarrierID) ->
+    %% ets:match returns [[ItemID], ...] for the matching ItemID column.
+    ItemIDs = case ets:info(?BUNDLE_OF_ITEM_TABLE) of
+        undefined -> [];
+        _ -> [Id || [Id] <- ets:match(?BUNDLE_OF_ITEM_TABLE, {'$1', CarrierID})]
+    end,
+    lists:foreach(fun(ItemID) ->
+        remove_tx(ItemID),
+        catch ets:delete(?SEEN_ITEMS_TABLE, ItemID),
+        catch ets:delete(?BUNDLE_OF_ITEM_TABLE, ItemID)
+    end, ItemIDs),
+    ok.
 
 %% @doc Build index from mempool (pending unconfirmed TXs).
 build_from_mempool() ->
