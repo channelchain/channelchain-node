@@ -29,7 +29,9 @@
 
 -module(ar_bundle_parser).
 
--export([parse/1, item_id/1, decode_tags/1, is_anonymous/1]).
+-export([parse/1, item_id/1, item_data/1, item_tags/1,
+         find_item/2,
+         decode_tags/1, is_anonymous/1]).
 -export_type([bundle_item/0, tag/0, item_kind/0]).
 
 -include_lib("arweave/include/ar_bundle.hrl").
@@ -254,6 +256,20 @@ is_anonymous(#bundle_item{kind = signed})    -> false.
 %%   - anonymous item: SHA-256(deepHash(item))       (ChannelChain extension)
 -spec item_id(bundle_item()) -> binary().
 item_id(#bundle_item{id = Id}) -> Id.
+
+%% @doc Raw data payload of the item.
+-spec item_data(bundle_item()) -> binary().
+item_data(#bundle_item{data = D}) -> D.
+
+%% @doc Decoded tag list of the item.
+-spec item_tags(bundle_item()) -> [tag()].
+item_tags(#bundle_item{tags = T}) -> T.
+
+%% @doc Find an item by its id in a list of parsed items.
+-spec find_item([bundle_item()], binary()) -> {ok, bundle_item()} | not_found.
+find_item([], _) -> not_found;
+find_item([#bundle_item{id = Id} = Item | _], Id) -> {ok, Item};
+find_item([_ | Rest], Id) -> find_item(Rest, Id).
 
 item_id_from_signature(Sig) ->
     crypto:hash(sha256, Sig).

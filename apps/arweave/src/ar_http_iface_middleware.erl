@@ -3622,22 +3622,52 @@ handle_channelchain_tx_data(Hash, Req) ->
 		{error, invalid} ->
 			{400, #{}, <<"Invalid hash.">>, Req};
 		{ok, TXID} ->
-			case ar_storage:read_tx(TXID) of
-				unavailable ->
-					%% Try mempool
-					case ar_mempool:get_tx(TXID) of
-						not_found ->
-							{404, #{}, <<"TX not found.">>, Req};
-						TX ->
-							serve_channelchain_tx_data(TX, Req)
+			case fetch_tx_anywhere(TXID) of
+				not_found ->
+					%% Bundle pseudo-TX fallback: TXID may be the id
+					%% of an item that was delivered inside a bundle
+					%% carrier. The chain stores only the carrier; we
+					%% reverse-lookup the carrier and parse out the
+					%% item's data.
+					case fetch_bundle_item_data(TXID) of
+						{ok, Data} -> serve_data(Data, Req);
+						not_found  -> {404, #{}, <<"TX not found.">>, Req}
 					end;
 				TX ->
-					serve_channelchain_tx_data(TX, Req)
+					serve_data(TX#tx.data, Req)
 			end
 	end.
 
-serve_channelchain_tx_data(TX, Req) ->
-	Data = TX#tx.data,
+fetch_tx_anywhere(TXID) ->
+	case ar_storage:read_tx(TXID) of
+		unavailable ->
+			case ar_mempool:get_tx(TXID) of
+				not_found -> not_found;
+				TX        -> TX
+			end;
+		TX -> TX
+	end.
+
+fetch_bundle_item_data(ItemID) ->
+	case ar_channelchain_index:bundle_of_item(ItemID) of
+		undefined -> not_found;
+		CarrierID ->
+			case fetch_tx_anywhere(CarrierID) of
+				not_found  -> not_found;
+				CarrierTX ->
+					case ar_bundle_parser:parse(CarrierTX#tx.data) of
+						{ok, Items} ->
+							case ar_bundle_parser:find_item(Items, ItemID) of
+								{ok, Item} -> {ok, ar_bundle_parser:item_data(Item)};
+								not_found  -> not_found
+							end;
+						{error, _} ->
+							not_found
+					end
+			end
+	end.
+
+serve_data(Data, Req) ->
 	{200,
 		#{<<"content-type">> => <<"application/octet-stream">>,
 		  <<"access-control-allow-origin">> => <<"*">>},

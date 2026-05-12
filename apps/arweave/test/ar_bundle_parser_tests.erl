@@ -217,6 +217,23 @@ tag_count_mismatch_test() ->
                  ar_bundle_parser:parse(Bundle)).
 
 %%%-------------------------------------------------------------------
+%%% Accessors: item_data / item_tags / find_item
+%%%-------------------------------------------------------------------
+
+accessors_test() ->
+    BundleBin = read_fixture("bundle_v2.bin"),
+    {ok, [I1, I2] = Items} = ar_bundle_parser:parse(BundleBin),
+    ?assertEqual(<<"hello">>, ar_bundle_parser:item_data(I1)),
+    ?assertEqual(<<"世界"/utf8>>, ar_bundle_parser:item_data(I2)),
+    ?assert(is_list(ar_bundle_parser:item_tags(I1))),
+    Id1 = ar_bundle_parser:item_id(I1),
+    Id2 = ar_bundle_parser:item_id(I2),
+    ?assertEqual({ok, I1}, ar_bundle_parser:find_item(Items, Id1)),
+    ?assertEqual({ok, I2}, ar_bundle_parser:find_item(Items, Id2)),
+    ?assertEqual(not_found,
+                 ar_bundle_parser:find_item(Items, crypto:hash(sha256, <<"missing">>))).
+
+%%%-------------------------------------------------------------------
 %%% E3 / U10: hard limit — too many items
 %%%-------------------------------------------------------------------
 
