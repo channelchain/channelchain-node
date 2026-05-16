@@ -37,7 +37,12 @@
     {<<"Bundle-Version">>,  <<"2.0.0">>}
 ]).
 
--define(DEFAULT_BUNDLE_POW_DIFFICULTY, 24).
+%% U1 default: 18. Lowered from 24 so the carrier-PoW cost per post,
+%% even at a maxItems=1 sequencer batch, stays comparable to the
+%% direct-submission item PoW (difficulty 20). A future revision can
+%% scale difficulty with bundle size; for now the constant is the
+%% knob.
+-define(DEFAULT_BUNDLE_POW_DIFFICULTY, 18).
 
 -type opt() :: {difficulty, non_neg_integer()}              %% per-item PoW override
              | {bundle_pow_difficulty, non_neg_integer()}    %% carrier PoW override
