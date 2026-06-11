@@ -122,7 +122,15 @@ start_http_iface_listener(Config) ->
 		env => #{
 			dispatch => Dispatch
 		},
-		metrics_callback => fun prometheus_cowboy2_instrumenter:observe/1,
+		%% Wrap the prometheus instrumenter so a missing/torn-down counter
+		%% (badarg from ets:lookup on prometheus_counter_table) cannot crash
+		%% the cowboy stream during terminate -> Unhandled exception. Without
+		%% this, a single dropped metric escalates into a 500 reply + supervisor
+		%% restart pressure across the listener.
+		metrics_callback => fun(M) ->
+			try prometheus_cowboy2_instrumenter:observe(M)
+			catch _:_ -> ok end
+		end,
 		stream_handlers => [cowboy_metrics_h, cowboy_stream_h]
 	},
 	case TlsCertfilePath of

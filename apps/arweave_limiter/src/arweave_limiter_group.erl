@@ -53,19 +53,46 @@ config(LimiterRef) ->
 
 register_or_reject_call(LimiterRef, Peer) ->
     {Time, Value} = timer:tc(fun do_register_or_reject_call/2, [LimiterRef, Peer]),
-    prometheus_histogram:observe(ar_limiter_response_time_microseconds, [atom_to_list(LimiterRef)], Time),
+    safe_observe(ar_limiter_response_time_microseconds, [atom_to_list(LimiterRef)], Time),
     Value.
 
 do_register_or_reject_call(LimiterRef, Peer) ->
-    prometheus_counter:inc(ar_limiter_requests_total,
-                           [atom_to_list(LimiterRef)]),
+    %% Defend against the race where the prometheus counters haven't been
+    %% registered yet (or the prometheus tables were torn down during a
+    %% shutdown). Letting badarg propagate here cascades into a cowboy
+    %% stream crash and starves the supervisor restart budget.
+    safe_inc(ar_limiter_requests_total, [atom_to_list(LimiterRef)]),
     case gen_server:call(LimiterRef, {register_or_reject, Peer}) of
         {reject, Reason, _Data} = Rejection ->
-            prometheus_counter:inc(ar_limiter_rejected_total,
-                                   [atom_to_list(LimiterRef), atom_to_list(Reason)]),
+            safe_inc(ar_limiter_rejected_total,
+                     [atom_to_list(LimiterRef), atom_to_list(Reason)]),
             Rejection;
         Accept ->
             Accept
+    end.
+
+%% Wrapper that swallows badarg from prometheus_counter when the metric or
+%% backing ETS table is not (yet) initialised. Metrics that get dropped here
+%% just produce slightly lower counts; the request itself proceeds normally.
+safe_inc(Name, Labels) ->
+    try prometheus_counter:inc(Name, Labels)
+    catch
+        error:badarg -> ok;
+        _:_ -> ok
+    end.
+
+safe_inc(Name, Labels, Amount) ->
+    try prometheus_counter:inc(Name, Labels, Amount)
+    catch
+        error:badarg -> ok;
+        _:_ -> ok
+    end.
+
+safe_observe(Name, Labels, Value) ->
+    try prometheus_histogram:observe(Name, Labels, Value)
+    catch
+        error:badarg -> ok;
+        _:_ -> ok
     end.
 
 %% This function is called when a transaction is accepted. This is how the previous
@@ -73,8 +100,8 @@ do_register_or_reject_call(LimiterRef, Peer) ->
 %% reduction is still occurring).
 reduce_for_peer(LimiterRef, Peer) ->
     Result = gen_server:call(LimiterRef, {reduce_for_peer, Peer}),
-    Result == ok andalso prometheus_counter:inc(ar_limiter_reduce_requests_total,
-                                                [atom_to_list(LimiterRef)]),
+    Result == ok andalso safe_inc(ar_limiter_reduce_requests_total,
+                                  [atom_to_list(LimiterRef)]),
     Result.
 
 reset_all(LimiterRef) ->
@@ -227,19 +254,19 @@ handle_info({tick, sliding_window_timestamp_cleanup},
     Now = arweave_limiter_time:ts_now(),
     NewSlidingTimestamps = cleanup_expired_sliding_peers(SlidingTimestamps, CleanupExpiry, Now),
     Deleted = maps:size(SlidingTimestamps) - maps:size(NewSlidingTimestamps),
-    prometheus_counter:inc(ar_limiter_cleanup_tick_expired_sliding_peers_deleted_total, [Id], Deleted),
+    safe_inc(ar_limiter_cleanup_tick_expired_sliding_peers_deleted_total, [Id], Deleted),
     {noreply, State#{sliding_timestamps => NewSlidingTimestamps}};
 handle_info({tick, leaky_bucket_reduction},
             State = #{id := Id, tick_reduction := TickReduction, leaky_tokens := LeakyTokens}) ->
     %% This is going to be more precise than ar_limiter_leaky_ticks*ar_limiter_peers
-    prometheus_counter:inc(ar_limiter_leaky_ticks, [Id]),
+    safe_inc(ar_limiter_leaky_ticks, [Id]),
     SizeBefore = maps:size(LeakyTokens),
-    prometheus_counter:inc(ar_limiter_leaky_tick_reductions_peer, [Id], SizeBefore),
+    safe_inc(ar_limiter_leaky_tick_reductions_peer, [Id], SizeBefore),
     NewTokens =
         maps:fold(fun(Key, Value, AccIn) ->
                           fold_decrease_rate(Id, Key, Value, AccIn, TickReduction)
                   end, #{}, LeakyTokens),
-    prometheus_counter:inc(
+    safe_inc(
       ar_limiter_leaky_tick_delete_peer_total, [Id], SizeBefore - maps:size(NewTokens)),
     {noreply, State#{leaky_tokens => NewTokens}};
 handle_info({'DOWN', MonitorRef, process, Pid, Reason},
@@ -316,10 +343,10 @@ fold_decrease_rate(_Id, _Key, Counter, Acc, _TickReduction)
   when is_integer(Counter), Counter =< 0 ->
     Acc;
 fold_decrease_rate(Id, Key, Counter, Acc, TickReduction) when Counter < TickReduction ->
-    prometheus_counter:inc(ar_limiter_leaky_tick_token_reductions_total, [Id], Counter),
+    safe_inc(ar_limiter_leaky_tick_token_reductions_total, [Id], Counter),
     maps:put(Key, 0, Acc);
 fold_decrease_rate(Id, Key, Counter, Acc, TickReduction) ->
-    prometheus_counter:inc(ar_limiter_leaky_tick_token_reductions_total, [Id], TickReduction),
+    safe_inc(ar_limiter_leaky_tick_token_reductions_total, [Id], TickReduction),
     maps:put(Key, Counter-TickReduction, Acc).
 
 %% Concurrency magic

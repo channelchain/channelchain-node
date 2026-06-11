@@ -27,13 +27,22 @@
 -include_lib("arweave_config/include/arweave_config.hrl").
 
 execute(Req, Env) ->
-    LimiterRef = get_limiter_ref(Req),
-    PeerKey = get_peer_key(Req),
-
-    case arweave_limiter:register_or_reject_call(LimiterRef, PeerKey) of
-        {reject, Reason, Data} ->
-            {stop, reject(Req, Reason, Data)};
-        _ ->
+    %% The limiter is best-effort. If it isn't fully wired up yet (config
+    %% gen_server not started, limiter group not yet registered for the
+    %% incoming path, prometheus tables torn down during a restart) we let
+    %% the request through rather than tearing down the cowboy stream with
+    %% an Unhandled exception.
+    try
+        LimiterRef = get_limiter_ref(Req),
+        PeerKey = get_peer_key(Req),
+        case arweave_limiter:register_or_reject_call(LimiterRef, PeerKey) of
+            {reject, Reason, Data} ->
+                {stop, reject(Req, Reason, Data)};
+            _ ->
+                {ok, Req, Env}
+        end
+    catch
+        _:_ ->
             {ok, Req, Env}
     end.
 
