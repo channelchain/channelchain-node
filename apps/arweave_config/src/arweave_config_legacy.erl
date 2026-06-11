@@ -200,7 +200,22 @@ reset() ->
 -spec get_env() -> {ok, #config{}}.
 
 get_env() ->
-	gen_server:call(?MODULE, get_env, 1000).
+	%% Robust against gen_server being down (startup race / restart window).
+	%% Fall back to application env so callers (ar_disksup, ar_tx_emitter, etc.)
+	%% don't cascade-crash if arweave_config_legacy is momentarily unavailable.
+	try gen_server:call(?MODULE, get_env, 1000)
+	catch
+		exit:{noproc, _} ->
+			case application:get_env(arweave, config) of
+				{ok, Config} = Ok when is_record(Config, config) -> Ok;
+				_ -> {ok, #config{}}
+			end;
+		exit:{timeout, _} ->
+			case application:get_env(arweave, config) of
+				{ok, Config} = Ok when is_record(Config, config) -> Ok;
+				_ -> {ok, #config{}}
+			end
+	end.
 
 %%--------------------------------------------------------------------
 %% @doc merge a configuration file (set only modified values).

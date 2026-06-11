@@ -626,10 +626,13 @@ store_state() ->
 		ar_tx_blacklist_offsets,
 		ar_tx_blacklist_pending_restore_headers
 	],
+	%% At shutdown, dets/ETS tables may already be gone. Catch badarg so a
+	%% missing table doesn't crash terminate/2 and cascade across the tree.
 	lists:foreach(
 		fun
 			(Name) ->
-				ets:to_dets(Name, Name)
+				try ets:to_dets(Name, Name)
+				catch error:badarg -> ok end
 		end,
 		Names
 	),
