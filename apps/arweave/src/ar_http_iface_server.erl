@@ -46,10 +46,27 @@ init(_) ->
 	% if something goes wrong, the connections must
 	% be cleaned before leaving.
 	erlang:process_flag(trap_exit, true),
+	%% ranch_sup may not have spun up yet on a fresh peer because
+	%% application:ensure_all_started/2 returns once apps are loaded, but the
+	%% top supervisors complete asynchronously. Wait a bounded amount of time
+	%% (5 s, ~100ms x 50) for ranch_sup before calling ranch:start_listener,
+	%% otherwise we get a noproc that cascades into ar_node_sup restart loops.
+	ok = wait_for_app(ranch_sup, 50, 100),
 	{ok, Config} = arweave_config:get_env(),
 	case start_http_iface_listener(Config) of
 		{ok, Pid} -> {ok, Pid};
 		Elsewise -> {error, Elsewise}
+	end.
+
+wait_for_app(_RegName, 0, _Sleep) ->
+	ok;
+wait_for_app(RegName, Retries, Sleep) ->
+	case whereis(RegName) of
+		undefined ->
+			timer:sleep(Sleep),
+			wait_for_app(RegName, Retries - 1, Sleep);
+		Pid when is_pid(Pid) ->
+			ok
 	end.
 
 split_path(Path) ->
