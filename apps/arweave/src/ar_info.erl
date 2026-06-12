@@ -38,7 +38,7 @@ get_info() ->
                 false -> ar_util:encode(Current)
             end,
         <<"blocks">> => BlockCount,
-        <<"peers">> => prometheus_gauge:value(arweave_peer_count),
+        <<"peers">> => safe_gauge_value(arweave_peer_count),
         <<"queue_length">> =>
             element(
                 2,
@@ -151,3 +151,15 @@ get_block_timestamp(B, Depth)
     <<"pending">>;
 get_block_timestamp(B, _Depth) ->
     ar_util:timestamp_to_seconds(B#block.receive_timestamp).
+
+%% Returns 0 instead of raising badarg when the prometheus_gauge has not yet
+%% been registered or its ETS table was torn down during a restart. Without
+%% this guard a request to /info during chain startup crashes the cowboy
+%% handler and starves the supervisor restart budget on a freshly joined peer.
+safe_gauge_value(Name) ->
+    try prometheus_gauge:value(Name) of
+        undefined -> 0;
+        Value -> Value
+    catch
+        _:_ -> 0
+    end.

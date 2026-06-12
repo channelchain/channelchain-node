@@ -687,7 +687,10 @@ close_dets() ->
 	lists:foreach(
 		fun
 			(Name) ->
-				case dets:close(Name) of
+				%% At node shutdown kernel_safe_sup tears down dets_sup before
+				%% ar_tx_blacklist:terminate runs, so dets:close raises noproc.
+				%% That cascade is purely cleanup -- no data is lost.
+				try dets:close(Name) of
 					ok ->
 						ok;
 					{error, Reason} ->
@@ -697,6 +700,9 @@ close_dets() ->
 							{name, Name},
 							{reason, Reason}
 						])
+				catch
+					exit:{noproc, _} -> ok;
+					_:_ -> ok
 				end
 		end,
 		Names
