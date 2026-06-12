@@ -127,7 +127,15 @@ handle_cast({poll, Ref}, #state{ ref = Ref, peer = Peer,
 				[{event, failed_to_get_recent_hash_list_diff},
 				{peer, ar_util:format_peer(Peer)},
 				{reason, io_lib:format("~p", [Reason])}]),
-			{noreply, State#state{ pause = true }}
+			%% Previously this branch set pause=true and the poller stopped
+			%% forever. With transient errors (gun_error closed normal during
+			%% startup, momentary peer unavailability, etc.) that means a
+			%% single hiccup permanently disconnected this worker from its
+			%% peer and the local height never caught up. Schedule a retry
+			%% instead -- if the peer is genuinely gone, ar_peers eventually
+			%% issues a new set_peer cast anyway.
+			ar_util:cast_after(FrequencyMs, self(), {poll, Ref}),
+			{noreply, State}
 	end;
 handle_cast({poll, _Ref}, State) ->
 	{noreply, State};
