@@ -21,10 +21,17 @@ start_link(Name, InitCapacity) ->
 %% @doc Acquire the semaphore, willing to wait for the provided
 %% Timeout.
 acquire(Name, Timeout) ->
+	%% Defend against the gen_server not running yet (startup race) or having
+	%% been torn down during a restart. Returning ok preserves the request
+	%% handler -- the semaphore is purely a rate-limiting/queueing aid, and
+	%% letting the request through is much better than crashing the cowboy
+	%% stream with noproc and starving the supervisor restart budget.
 	try
 		gen_server:call(Name, acquire, Timeout)
 	catch
-		exit:{timeout, _} -> {error, timeout}
+		exit:{timeout, _} -> {error, timeout};
+		exit:{noproc, _} -> ok;
+		exit:{shutdown, _} -> ok
 	end.
 
 %% @doc Close the semaphore and stop the process registered under the
