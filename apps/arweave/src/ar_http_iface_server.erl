@@ -46,27 +46,34 @@ init(_) ->
 	% if something goes wrong, the connections must
 	% be cleaned before leaving.
 	erlang:process_flag(trap_exit, true),
-	%% ranch_sup may not have spun up yet on a fresh peer because
-	%% application:ensure_all_started/2 returns once apps are loaded, but the
-	%% top supervisors complete asynchronously. Wait a bounded amount of time
-	%% (5 s, ~100ms x 50) for ranch_sup before calling ranch:start_listener,
-	%% otherwise we get a noproc that cascades into ar_node_sup restart loops.
-	ok = wait_for_app(ranch_sup, 50, 100),
+	%% Block here until ranch is actually responsive. application:ensure_all_started/2
+	%% returns when ranch_app's top module finishes start/2 -- ranch_sup may be
+	%% registered but its gen_server init isn't done, so a bare whereis check is not
+	%% enough. Probe ranch_sup with a small synchronous call (info on children) until
+	%% it answers, otherwise the upcoming ranch:start_listener crashes with noproc.
+	ok = wait_for_ranch_ready(50, 100),
 	{ok, Config} = arweave_config:get_env(),
 	case start_http_iface_listener(Config) of
 		{ok, Pid} -> {ok, Pid};
 		Elsewise -> {error, Elsewise}
 	end.
 
-wait_for_app(_RegName, 0, _Sleep) ->
+wait_for_ranch_ready(0, _Sleep) ->
 	ok;
-wait_for_app(RegName, Retries, Sleep) ->
-	case whereis(RegName) of
-		undefined ->
+wait_for_ranch_ready(Retries, Sleep) ->
+	try
+		_ = supervisor:which_children(ranch_sup),
+		ok
+	catch
+		exit:{noproc, _} ->
 			timer:sleep(Sleep),
-			wait_for_app(RegName, Retries - 1, Sleep);
-		Pid when is_pid(Pid) ->
-			ok
+			wait_for_ranch_ready(Retries - 1, Sleep);
+		exit:{shutdown, _} ->
+			timer:sleep(Sleep),
+			wait_for_ranch_ready(Retries - 1, Sleep);
+		_:_ ->
+			timer:sleep(Sleep),
+			wait_for_ranch_ready(Retries - 1, Sleep)
 	end.
 
 split_path(Path) ->
@@ -152,12 +159,36 @@ start_http_iface_listener(Config) ->
 	},
 	case TlsCertfilePath of
 		not_set ->
-			cowboy:start_clear(ar_http_iface_listener, TransportOpts, ProtocolOpts);
+			retry_start_listener(fun() ->
+				cowboy:start_clear(ar_http_iface_listener, TransportOpts, ProtocolOpts)
+			end, 30, 200);
 		_ ->
-			cowboy:start_tls(ar_http_iface_listener, TransportOpts ++ [
-				{certfile, TlsCertfilePath},
-				{keyfile, TlsKeyfilePath}
-			], ProtocolOpts)
+			retry_start_listener(fun() ->
+				cowboy:start_tls(ar_http_iface_listener, TransportOpts ++ [
+					{certfile, TlsCertfilePath},
+					{keyfile, TlsKeyfilePath}
+				], ProtocolOpts)
+			end, 30, 200)
+	end.
+
+%% cowboy:start_clear / cowboy:start_tls delegate to ranch:start_listener which
+%% gen_server:call's ranch_sup. On a fresh peer ranch_sup can be registered but
+%% still running init/1 at that instant -> noproc. Retry the listener boot a
+%% bounded number of times instead of letting it cascade through ar_node_sup.
+retry_start_listener(_Fun, 0, _Sleep) ->
+	{error, ranch_sup_unavailable};
+retry_start_listener(Fun, Retries, Sleep) ->
+	try Fun() of
+		{ok, _} = Ok -> Ok;
+		{error, {already_started, _}} = Already -> Already;
+		Other -> Other
+	catch
+		exit:{noproc, _} ->
+			timer:sleep(Sleep),
+			retry_start_listener(Fun, Retries - 1, Sleep);
+		exit:{shutdown, _} ->
+			timer:sleep(Sleep),
+			retry_start_listener(Fun, Retries - 1, Sleep)
 	end.
 
 name_route([]) ->
