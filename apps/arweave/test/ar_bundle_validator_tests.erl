@@ -44,8 +44,15 @@ wrong_bundle_version_test() ->
 missing_bundle_pow_nonce_test() ->
     Carrier = make_carrier(remove_tag(<<"Bundle-PoW-Nonce">>, base_tags()),
                            <<"_unused_">>),
-    ?assertMatch({error, missing_bundle_pow_nonce},
+    ?assertMatch({error, no_acceptance_path},
                  ar_bundle_validator:validate_bundle(Carrier)).
+
+reserved_carrier_tags_rejected_test_() ->
+    [?_assertMatch({error, {reserved_tag_used, Tag}},
+                   ar_bundle_validator:validate_bundle(
+                       make_carrier([{Tag, <<"reserved">>} | base_tags()],
+                                    <<"_unused_">>)))
+     || Tag <- [<<"Committee-Cert">>, <<"Committee-Round">>, <<"Committee-Members">>]].
 
 %%%-------------------------------------------------------------------
 %%% Carrier PoW

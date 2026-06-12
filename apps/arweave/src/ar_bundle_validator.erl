@@ -2,14 +2,15 @@
 %%%
 %%% validate_bundle/1 implements the §3 pipeline:
 %%%
-%%%   1. carrier tag check         (Bundle-Format / Bundle-Version /
-%%%                                  App-Name / Type / Bundle-PoW-Nonce)
-%%%   2. carrier PoW                (ar_bundle_verify:verify_carrier_pow)
-%%%   3. parse                      (ar_bundle_parser:parse)
-%%%   4. per-item verify            (ar_bundle_verify:verify_item)
-%%%   5. pseudo TX synthesis        (#tx{} records compatible with the
+%%%   1. carrier tag check          (Bundle-Format / Bundle-Version /
+%%%                                   App-Name / Type)
+%%%   2. acceptance path dispatch   (v1: Bundle-PoW-Nonce only)
+%%%   3. carrier PoW                (ar_bundle_verify:verify_carrier_pow)
+%%%   4. parse                      (ar_bundle_parser:parse)
+%%%   5. per-item verify            (ar_bundle_verify:verify_item)
+%%%   6. pseudo TX synthesis        (#tx{} records compatible with the
 %%%                                  rest of the chain)
-%%%   6. ChannelChain semantic check (ar_bbs_validator:validate)
+%%%   7. ChannelChain semantic check (ar_bbs_validator:validate)
 %%%
 %%% Any single item failure causes the whole carrier to be rejected
 %%% (no partial acceptance, §3). The function returns {ok, [#tx{}]} on
@@ -43,6 +44,11 @@
 %% scale difficulty with bundle size; for now the constant is the
 %% knob.
 -define(DEFAULT_BUNDLE_POW_DIFFICULTY, 18).
+-define(RESERVED_CARRIER_TAGS, [
+    <<"Committee-Cert">>,
+    <<"Committee-Round">>,
+    <<"Committee-Members">>
+]).
 
 -type opt() :: {difficulty, non_neg_integer()}              %% per-item PoW override
              | {bundle_pow_difficulty, non_neg_integer()}    %% carrier PoW override
@@ -73,16 +79,26 @@ verify_carrier(#tx{tags = Tags, data = BundleBin}, Opts) ->
         {missing, T} -> {error, {carrier_missing_tag, T}};
         {wrong_value, T, V} -> {error, {carrier_wrong_tag_value, T, V}};
         ok ->
-            case lists:keyfind(<<"Bundle-PoW-Nonce">>, 1, Tags) of
-                false ->
-                    {error, missing_bundle_pow_nonce};
-                {_, Nonce} ->
-                    Difficulty = bundle_pow_difficulty(Opts),
-                    case ar_bundle_verify:verify_carrier_pow(BundleBin, Nonce, Difficulty) of
-                        ok -> {ok, BundleBin};
-                        {error, _} = E -> E
-                    end
+            case reserved_tag(Tags) of
+                undefined ->
+                    validate_acceptance_path(Tags, BundleBin, Opts);
+                Tag ->
+                    {error, {reserved_tag_used, Tag}}
             end
+    end.
+
+validate_acceptance_path(Tags, BundleBin, Opts) ->
+    case acceptance_path(Tags) of
+        {pow, Nonce} ->
+            Difficulty = bundle_pow_difficulty(Opts),
+            case ar_bundle_verify:verify_carrier_pow(BundleBin, Nonce, Difficulty) of
+                ok -> {ok, BundleBin};
+                {error, _} = E -> E
+            end;
+        {cert, _Cert} ->
+            {error, cert_path_not_implemented_v1};
+        none ->
+            {error, no_acceptance_path}
     end.
 
 missing_required_tag(Tags) ->
@@ -98,6 +114,30 @@ missing_required_tag([{Name, Expected} | Rest], Tags) ->
 
 bundle_pow_difficulty(Opts) ->
     proplists:get_value(bundle_pow_difficulty, Opts, ?DEFAULT_BUNDLE_POW_DIFFICULTY).
+
+acceptance_path(Tags) ->
+    case {get_tag(<<"Bundle-PoW-Nonce">>, Tags),
+          get_tag(<<"Committee-Cert">>, Tags)} of
+        {Nonce, undefined} when Nonce =/= undefined -> {pow, Nonce};
+        {_, Cert} when Cert =/= undefined -> {cert, Cert};
+        {undefined, undefined} -> none
+    end.
+
+get_tag(Name, Tags) ->
+    case lists:keyfind(Name, 1, Tags) of
+        false -> undefined;
+        {_, Value} -> Value
+    end.
+
+reserved_tag(Tags) ->
+    reserved_tag(?RESERVED_CARRIER_TAGS, Tags).
+
+reserved_tag([], _Tags) -> undefined;
+reserved_tag([Name | Rest], Tags) ->
+    case lists:keymember(Name, 1, Tags) of
+        true -> Name;
+        false -> reserved_tag(Rest, Tags)
+    end.
 
 %%%-------------------------------------------------------------------
 %%% Item processing (§3 part 4..6)

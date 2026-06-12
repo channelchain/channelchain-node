@@ -25,7 +25,8 @@ c3_full_pipeline_test_() ->
      fun teardown_node_state/1,
      [{timeout, 30, fun pipeline_happy_path_skipping_bbs_validator/0},
       {timeout, 30, fun pipeline_reaches_bbs_validator_for_each_item/0},
-      {timeout, 30, fun bad_carrier_pow_blocks_pipeline/0}]}.
+      {timeout, 30, fun bad_carrier_pow_blocks_pipeline/0},
+      {timeout, 30, fun reserved_carrier_tag_blocks_pipeline/0}]}.
 
 setup_node_state() ->
     case ets:info(node_state) of
@@ -83,6 +84,20 @@ bad_carrier_pow_blocks_pipeline() ->
     Result = ar_bbs_validator:validate(Carrier, [{bundle_pow_difficulty, 12}]),
     ?assertMatch({error, <<"Bundle rejected: bad_carrier_pow">>}, Result).
 
+reserved_carrier_tag_blocks_pipeline() ->
+    BundleBin = read_fixture("bundle_v2_cc.bin"),
+    Carrier = make_carrier_with_tags([
+        {<<"App-Name">>,         <<"ChannelChain">>},
+        {<<"Type">>,             <<"Bundle">>},
+        {<<"Bundle-Format">>,    <<"binary">>},
+        {<<"Bundle-Version">>,   <<"2.0.0">>},
+        {<<"Bundle-PoW-Nonce">>, <<"0">>},
+        {<<"Committee-Cert">>,   <<"reserved">>}
+    ], BundleBin),
+    Result = ar_bbs_validator:validate(Carrier, [{bundle_pow_difficulty, 12}]),
+    ?assertMatch({error, <<"Bundle rejected: {reserved_tag_used,<<\"Committee-Cert\">>}">>},
+                 Result).
+
 %%%-------------------------------------------------------------------
 %%% Helpers
 %%%-------------------------------------------------------------------
@@ -95,6 +110,9 @@ make_carrier(Nonce, BundleBin) ->
         {<<"Bundle-Version">>,   <<"2.0.0">>},
         {<<"Bundle-PoW-Nonce">>, Nonce}
     ],
+    make_carrier_with_tags(Tags, BundleBin).
+
+make_carrier_with_tags(Tags, BundleBin) ->
     #tx{
         format    = 2,
         id        = crypto:hash(sha256, <<"e2e-carrier">>),
