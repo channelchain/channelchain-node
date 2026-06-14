@@ -189,7 +189,20 @@ maybe_index_tx(TX, Status) when is_record(TX, tx) ->
                         true ->
                             case get_tag_value(Tags, <<"Target-TX">>) of
                                 undefined -> ok;
-                                TargetTXID -> ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true})
+                                TargetTXID ->
+                                    ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true}),
+                                    %% Admin-Delete is physical: delegate to the
+                                    %% blacklist machinery so the target tx's
+                                    %% header and data are taken down from disk.
+                                    %% Other delete types (Moderator-Hide,
+                                    %% Board-Moderator-Hide, Self-Delete) remain
+                                    %% index-level only.
+                                    case Type of
+                                        <<"Admin-Delete">> ->
+                                            ar_tx_blacklist:blacklist_txs([TargetTXID]);
+                                        _ ->
+                                            ok
+                                    end
                             end;
                         false ->
                             ok

@@ -11,7 +11,7 @@
 -export([start_link/0, start_taking_down/0, is_tx_blacklisted/1, is_byte_blacklisted/1,
 		get_blacklisted_intervals/2, get_next_not_blacklisted_byte/1,
 		notify_about_removed_tx/1, norify_about_orphaned_tx/1, notify_about_added_tx/3,
-		store_state/0]).
+		blacklist_txs/1, store_state/0]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -136,6 +136,14 @@ norify_about_orphaned_tx(TXID) ->
 %% @doc Notify the server about the added transaction.
 notify_about_added_tx(TXID, End, Start) ->
 	gen_server:cast(?MODULE, {added_tx, TXID, End, Start}).
+
+%% @doc Add the given TXIDs to the blacklist programmatically.
+%% Used by ar_channelchain_index when an Admin-Delete tx is confirmed so that
+%% the target tx's header and data are removed from disk by the existing
+%% takedown machinery. Idempotent — re-blacklisting an already-blacklisted
+%% TXID is a no-op.
+blacklist_txs(TXIDs) when is_list(TXIDs) ->
+	gen_server:cast(?MODULE, {blacklist_txs, TXIDs}).
 
 %%%===================================================================
 %%% Generic server callbacks.
@@ -280,6 +288,35 @@ handle_cast({added_tx, TXID, End, Start}, State) ->
 			{noreply, State}
 	end;
 
+handle_cast({blacklist_txs, TXIDs}, State) ->
+	Added = lists:foldl(fun
+		(TXID, Acc) when is_binary(TXID) ->
+			%% Always mark sticky so refresh_blacklist will not restore it.
+			ets:insert(ar_tx_blacklist_programmatic, [{TXID}]),
+			case ets:member(ar_tx_blacklist, TXID) of
+				true ->
+					Acc;
+				false ->
+					ets:insert(ar_tx_blacklist, [{TXID}]),
+					ets:insert(ar_tx_blacklist_pending_headers, [{TXID}]),
+					ets:insert(ar_tx_blacklist_pending_data, [{TXID}]),
+					ets:delete(ar_tx_blacklist_pending_restore_headers, TXID),
+					[TXID | Acc]
+			end;
+		(_, Acc) ->
+			Acc
+	end, [], TXIDs),
+	case Added of
+		[] ->
+			{noreply, State};
+		_ ->
+			?LOG_INFO([{event, programmatic_blacklist},
+					{tags, [tx_blacklist]},
+					{added, length(Added)}]),
+			gen_server:cast(?MODULE, maybe_request_takedown),
+			{noreply, State}
+	end;
+
 handle_cast(Msg, State) ->
 	?LOG_ERROR([{event, unhandled_cast}, {module, ?MODULE}, {message, Msg}]),
 	{noreply, State}.
@@ -341,7 +378,8 @@ initialize_state() ->
 		ar_tx_blacklist_pending_headers,
 		ar_tx_blacklist_pending_data,
 		ar_tx_blacklist_offsets,
-		ar_tx_blacklist_pending_restore_headers
+		ar_tx_blacklist_pending_restore_headers,
+		ar_tx_blacklist_programmatic
 	],
 	lists:foreach(
 		fun
@@ -417,12 +455,20 @@ refresh_blacklist(Whitelist, Blacklist) ->
 					end;
 				(Entry, Acc) ->
 					TXID = element(1, Entry),
-					case sets:is_element(TXID, Whitelist)
-							orelse not sets:is_element(TXID, Blacklist) of
+					%% Skip TXIDs added programmatically (on-chain
+					%% Admin-Delete) — they must not be restored by a
+					%% config-file/URL refresh that doesn't know about them.
+					case ets:member(ar_tx_blacklist_programmatic, TXID) of
 						true ->
-							[TXID | Acc];
+							Acc;
 						false ->
-							Acc
+							case sets:is_element(TXID, Whitelist)
+									orelse not sets:is_element(TXID, Blacklist) of
+								true ->
+									[TXID | Acc];
+								false ->
+									Acc
+							end
 					end
 			end,
 			[],
@@ -608,7 +654,17 @@ request_data_takedown(State) ->
 									{tx, ar_util:encode(TXID)},
 									{reason, io_lib:format("~p", [Reason])}]),
 							ets:delete(ar_tx_blacklist_pending_data, TXID),
-							ets:delete(ar_tx_blacklist, TXID),
+							%% For programmatic (on-chain Admin-Delete) entries,
+							%% keep the blacklist marker — the data offset may
+							%% become available later, or the tx may arrive
+							%% from a peer. Removal would let the deleted tx
+							%% be re-served.
+							case ets:member(ar_tx_blacklist_programmatic, TXID) of
+								true ->
+									ok;
+								false ->
+									ets:delete(ar_tx_blacklist, TXID)
+							end,
 							State
 					end;
 				[{TXID, End, Start}] ->
@@ -624,7 +680,8 @@ store_state() ->
 		ar_tx_blacklist_pending_headers,
 		ar_tx_blacklist_pending_data,
 		ar_tx_blacklist_offsets,
-		ar_tx_blacklist_pending_restore_headers
+		ar_tx_blacklist_pending_restore_headers,
+		ar_tx_blacklist_programmatic
 	],
 	%% At shutdown, dets/ETS tables may already be gone. Catch badarg so a
 	%% missing table doesn't crash terminate/2 and cascade across the tree.
@@ -682,7 +739,8 @@ close_dets() ->
 		ar_tx_blacklist_pending_headers,
 		ar_tx_blacklist_pending_data,
 		ar_tx_blacklist_offsets,
-		ar_tx_blacklist_pending_restore_headers
+		ar_tx_blacklist_pending_restore_headers,
+		ar_tx_blacklist_programmatic
 	],
 	lists:foreach(
 		fun
