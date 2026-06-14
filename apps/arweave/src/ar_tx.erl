@@ -112,8 +112,20 @@ verify(TX, Args, VerifySignature) ->
 %% @doc Verify the given transaction actually has the given identifier.
 %% Compute the signature data segment, verify the signature, and check
 %% whether its SHA2-256 hash equals the expected identifier.
+%%
+%% ChannelChain anonymous BBS posts carry an empty owner/signature and are
+%% gated by PoW-Nonce instead of an RSA signature. Without the special case
+%% verify_signature_v{1,2} would unconditionally reject them (rsa_pss against
+%% an empty modulus), which is correct for upstream Arweave but breaks
+%% ar_join when the trail contains anonymous txs. Mirror the receive-side
+%% behaviour in ar_tx:do_verify_v2 by validating PoW-Nonce instead, so a
+%% peer-served anonymous tx whose id and hash agree is accepted during JOIN.
+verify_tx_id(ExpectedID, #tx{ format = 1, signature = <<>>, id = ID } = TX) ->
+	ExpectedID == ID andalso ar_pow_verify:validate_tx_pow(TX) andalso verify_hash(TX);
 verify_tx_id(ExpectedID, #tx{ format = 1, id = ID } = TX) ->
 	ExpectedID == ID andalso verify_signature_v1(TX, verify_signature) andalso verify_hash(TX);
+verify_tx_id(ExpectedID, #tx{ format = 2, signature = <<>>, id = ID } = TX) ->
+	ExpectedID == ID andalso ar_pow_verify:validate_tx_pow(TX) andalso verify_hash(TX);
 verify_tx_id(ExpectedID, #tx{ format = 2, id = ID } = TX) ->
 	ExpectedID == ID andalso verify_signature_v2(TX, verify_signature) andalso verify_hash(TX).
 
