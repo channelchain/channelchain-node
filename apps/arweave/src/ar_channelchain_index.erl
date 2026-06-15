@@ -191,15 +191,19 @@ maybe_index_tx(TX, Status) when is_record(TX, tx) ->
                                 undefined -> ok;
                                 TargetTXID ->
                                     ets:insert(?DELETED_TXS_TABLE, {TargetTXID, true}),
-                                    %% Admin-Delete is physical: delegate to the
-                                    %% blacklist machinery so the target tx's
-                                    %% header and data are taken down from disk.
-                                    %% Other delete types (Moderator-Hide,
-                                    %% Board-Moderator-Hide, Self-Delete) remain
-                                    %% index-level only.
                                     case Type of
                                         <<"Admin-Delete">> ->
-                                            ar_tx_blacklist:blacklist_txs([TargetTXID]);
+                                            %% Target-TX is base64url-encoded;
+                                            %% blacklist expects raw binary.
+                                            case catch ar_util:decode(TargetTXID) of
+                                                Decoded when is_binary(Decoded),
+                                                             byte_size(Decoded) =:= 32 ->
+                                                    ar_tx_blacklist:blacklist_txs([Decoded]);
+                                                _ ->
+                                                    ?LOG_WARNING([{event,
+                                                            channelchain_admin_delete_bad_target},
+                                                            {target, TargetTXID}])
+                                            end;
                                         _ ->
                                             ok
                                     end

@@ -742,11 +742,18 @@ read_tx(TX) when is_record(TX, tx) ->
 read_tx(TXs) when is_list(TXs) ->
 	lists:map(fun read_tx/1, TXs);
 read_tx(ID) ->
-	case read_tx_from_disk_cache(ID) of
-		unavailable ->
-			read_tx2(ID);
-		TX ->
-			TX
+	%% A blacklisted tx may still have a stale entry in disk_cache; never
+	%% serve it from there (would defeat Admin-Delete physical removal).
+	case ar_tx_blacklist:is_tx_blacklisted(ID) of
+		true ->
+			unavailable;
+		false ->
+			case read_tx_from_disk_cache(ID) of
+				unavailable ->
+					read_tx2(ID);
+				TX ->
+					TX
+			end
 	end.
 
 read_tx2(ID) ->
