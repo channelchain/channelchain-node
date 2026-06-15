@@ -1261,6 +1261,11 @@ get_tx_from_remote_peer(Peer, TXID, RatePeer) ->
 			?LOG_INFO([{event, accepted_tombstone_tx},
 					{peer, ar_util:format_peer(Peer)},
 					{tx, ar_util:encode(TXID)}]),
+			%% Persist the tombstone locally so subsequent queries to
+			%% this node return 410 + the same stub instead of 404 —
+			%% keeps the deletion semantic propagating instead of just
+			%% the trail validity.
+			catch ar_storage:write_tombstone(Stub),
 			{Stub, Peer, Time, Size};
 		{ok, {tombstone, _Stub}, _Time, _Size} ->
 			ar_peers:issue_warning(Peer, tx, tombstone_id_mismatch),

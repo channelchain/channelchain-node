@@ -95,6 +95,11 @@ init([]) ->
     ar_events:subscribe(tx),
     %% Subscribe to block events (TX confirmed in block)
     ar_events:subscribe(block),
+    %% Subscribe to node_state so we can rebuild the index after a JOIN
+    %% finishes — blocks applied via ar_node_worker's join path do not
+    %% fire {block, {new, _, _}}, so the Admin-Delete hook would miss
+    %% every historical Admin-Delete tx in the trail otherwise.
+    ar_events:subscribe(node_state),
     %% Schedule initial index build from confirmed blocks
     gen_server:cast(self(), build_index),
     {ok, #{}}.
@@ -156,6 +161,18 @@ handle_info({event, block, {orphaned, B}}, State) ->
     lists:foreach(fun(TXID) ->
         remove_tx(TXID)
     end, B#block.txs),
+    {noreply, State};
+
+handle_info({event, node_state, {initialized, _B}}, State) ->
+    %% The {initialized, _} event fires before block headers settle on
+    %% disk after a JOIN — calling build_index here immediately finds
+    %% an empty block index. Defer a few seconds.
+    ar_util:cast_after(5000, self(), build_index),
+    %% And again later, in case the chain was still backfilling.
+    ar_util:cast_after(20000, self(), build_index),
+    {noreply, State};
+
+handle_info({event, node_state, _}, State) ->
     {noreply, State};
 
 handle_info(_Info, State) ->
