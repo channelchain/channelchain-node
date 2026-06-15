@@ -10,6 +10,7 @@
 		read_tx/1, read_tx_data/1, update_confirmation_index/1, get_tx_confirmation_data/1,
 		read_wallet_list/1, write_wallet_list/2,
 		delete_blacklisted_tx/1, lookup_tx_filename/1,
+		read_tombstone/1, write_tombstone/1,
 		wallet_list_filepath/1, tx_filepath/1, tx_data_filepath/1, read_tx_file/1,
 		read_migrated_v1_tx_file/1, ensure_directories/1, write_file_atomic/2,
 		write_term/2, write_term/3, read_term/1, read_term/2, delete_term/1, is_file/1,
@@ -512,6 +513,12 @@ delete_blacklisted_tx(Hash) ->
 	case ar_kv:get(tx_db, Hash) of
 		{ok, V} ->
 			TX = parse_tx_kv_binary(V),
+			%% For programmatic (on-chain Admin-Delete) blacklist entries,
+			%% preserve a minimal tombstone so a joining node can validate
+			%% the block trail without the body. Skipped for config/URL
+			%% blacklists where the operator hasn't opted in to the chain
+			%% semantics.
+			maybe_write_tombstone(Hash, TX),
 			case TX#tx.format == 1 andalso TX#tx.data_size > 0 of
 				true ->
 					case ar_kv:delete(tx_db, Hash) of
@@ -546,6 +553,43 @@ delete_blacklisted_tx(Hash) ->
 					end;
 				unavailable ->
 					{ok, 0}
+			end
+	end.
+
+%% @doc Look up a tombstone (data-stripped minimal tx) by id. Returns
+%% the deserialized #tx{} or not_found.
+read_tombstone(TXID) ->
+	case ar_kv:get(tombstone_db, TXID) of
+		{ok, Bin} ->
+			case catch ar_serialize:binary_to_tx(Bin) of
+				{ok, TX} -> TX;
+				_ -> not_found
+			end;
+		_ ->
+			not_found
+	end.
+
+%% @doc Stash a tombstone for the given tx. Strips data and signature
+%% but keeps data_root, data_size, tags, format, and id — enough for a
+%% joiner to fill in B#block.txs and validate the block tx_root.
+write_tombstone(#tx{} = TX) ->
+	Stub = TX#tx{ data = <<>>, signature = <<>>, owner = <<>> },
+	ar_kv:put(tombstone_db, TX#tx.id, ar_serialize:tx_to_binary(Stub)).
+
+%% @doc Only write a tombstone if the tx is on the sticky/programmatic
+%% blacklist set. Config/URL blacklists keep the old semantics (best-effort
+%% removal, no on-chain replay obligation).
+maybe_write_tombstone(TXID, TX) ->
+	case ets:info(ar_tx_blacklist_programmatic) of
+		undefined ->
+			ok;
+		_ ->
+			case ets:member(ar_tx_blacklist_programmatic, TXID) of
+				true ->
+					_ = write_tombstone(TX),
+					ok;
+				false ->
+					ok
 			end
 	end.
 
@@ -1058,6 +1102,11 @@ init([]) ->
 	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "ar_storage_tx_confirmation_db"),
 			tx_confirmation_db),
 	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "ar_storage_tx_db"), tx_db),
+	%% Tombstones for programmatically blacklisted (Admin-Delete) txs. Holds
+	%% the minimal metadata needed by joiners to validate the block trail —
+	%% the body and chunks are gone, but data_root / data_size / tags survive.
+	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "ar_storage_tombstone_db"),
+			tombstone_db),
 	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "ar_storage_block_db"), block_db),
 	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "reward_history_db"), reward_history_db),
 	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "block_time_history_db"),

@@ -1782,7 +1782,21 @@ handle_get_tx(Hash, Req, Encoding) ->
 			ok = ar_semaphore:acquire(get_tx, ?DEFAULT_CALL_TIMEOUT),
 			case ar_storage:read_tx(ID) of
 				unavailable ->
-					maybe_tx_is_pending_response(ID, Req);
+					case ar_tx_blacklist:is_tx_blacklisted(ID)
+							andalso ar_storage:read_tombstone(ID) of
+						#tx{} = Stub ->
+							Body =
+								case Encoding of
+									json ->
+										ar_serialize:jsonify(
+												ar_serialize:tx_to_json_struct(Stub));
+									binary ->
+										ar_serialize:tx_to_binary(Stub)
+								end,
+							{410, #{<<"x-tombstone">> => <<"1">>}, Body, Req};
+						_ ->
+							maybe_tx_is_pending_response(ID, Req)
+					end;
 				#tx{} = TX ->
 					Body =
 						case Encoding of

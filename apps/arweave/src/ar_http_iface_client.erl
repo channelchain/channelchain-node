@@ -1252,6 +1252,19 @@ get_tx_from_remote_peer(Peer, TXID, RatePeer) ->
 					end,
 					{TX, Peer, Time, Size}
 			end;
+		{ok, {tombstone, #tx{ id = StubID } = Stub}, Time, Size} when StubID =:= TXID ->
+			%% Peer holds an on-chain Admin-Delete tombstone for this tx.
+			%% Body and signature are gone; data_root / tags are preserved
+			%% so the joiner can still rebuild B#block.txs and validate
+			%% the block tx_root. Skip the signature/PoW check — the
+			%% original tx is, by definition, unreconstructable.
+			?LOG_INFO([{event, accepted_tombstone_tx},
+					{peer, ar_util:format_peer(Peer)},
+					{tx, ar_util:encode(TXID)}]),
+			{Stub, Peer, Time, Size};
+		{ok, {tombstone, _Stub}, _Time, _Size} ->
+			ar_peers:issue_warning(Peer, tx, tombstone_id_mismatch),
+			{error, invalid_tx};
 		Error ->
 			Error
 	end.
@@ -1400,6 +1413,34 @@ handle_tx_response(_Peer, _Encoding, {ok, {{<<"404">>, _}, _, _, _, _}}) ->
 	{error, not_found};
 handle_tx_response(_Peer, _Encoding, {ok, {{<<"400">>, _}, _, _, _, _}}) ->
 	{error, bad_request};
+handle_tx_response(_Peer, Encoding, {ok, {{<<"410">>, _}, Headers, Body, Start, End}}) ->
+	IsTombstone = case Headers of
+		_ when is_map(Headers) ->
+			maps:get(<<"x-tombstone">>, Headers, undefined) =/= undefined;
+		_ when is_list(Headers) ->
+			lists:keymember(<<"x-tombstone">>, 1, Headers);
+		_ ->
+			false
+	end,
+	case IsTombstone of
+		false ->
+			{error, gone};
+		true ->
+			DecodeFun = case Encoding of
+				json -> fun ar_serialize:json_struct_to_tx/1;
+				binary -> fun ar_serialize:binary_to_tx/1
+			end,
+			case catch DecodeFun(Body) of
+				{ok, TX} when is_record(TX, tx) ->
+					{ok, {tombstone, TX}, End - Start,
+							byte_size(term_to_binary(TX))};
+				TX when is_record(TX, tx) ->
+					{ok, {tombstone, TX}, End - Start,
+							byte_size(term_to_binary(TX))};
+				_ ->
+					{error, bad_tombstone}
+			end
+	end;
 handle_tx_response(Peer, Encoding, {ok, {{<<"200">>, _}, _, Body, Start, End}}) ->
 	DecodeFun = case Encoding of json -> fun ar_serialize:json_struct_to_tx/1;
 			binary -> fun ar_serialize:binary_to_tx/1 end,
