@@ -569,11 +569,41 @@ read_tombstone(TXID) ->
 			not_found
 	end.
 
-%% @doc Stash a tombstone for the given tx. Strips data and signature
-%% but keeps data_root, data_size, tags, format, and id — enough for a
-%% joiner to fill in B#block.txs and validate the block tx_root.
+%% @doc Stash a tombstone for the given tx. The stub keeps the original
+%% tx id, the data_root, the data_size, and the tags so a joiner can
+%% rebuild B#block.txs and recompute tx_root without the original data.
+%%
+%% Format quirk: ar_serialize:binary_to_tx hard-codes
+%% `data_size = byte_size(data)` for format=1 (ar_serialize line ~1062),
+%% so a v1 stub with stripped data would round-trip to data_size = 0
+%% and the joiner's offset accounting in
+%% generate_size_tagged_list_from_txs would drift. v2 stores data_size
+%% explicitly. Pin the on-the-wire/on-disk stub to format=2 — the
+%% original tx's format only matters for get_tx_data_root, and for
+%% format=2 that's just `DataRoot` (no recomputation from `data`), so
+%% the joiner's tx_root math still lines up with the block's stored
+%% tx_root.
+%%
+%% For v1 anonymous BBS posts the on-disk tx_db record carries
+%% data_root = <<>> (data_root is normally recomputed from
+%% TX#tx.data via ar_block:get_tx_data_root). Fix it up now while the
+%% data is still in hand.
 write_tombstone(#tx{} = TX) ->
-	Stub = TX#tx{ data = <<>>, signature = <<>>, owner = <<>> },
+	DataRoot =
+		case TX#tx.data_root of
+			<<>> when TX#tx.data_size > 0, byte_size(TX#tx.data) > 0 ->
+				#tx{ data_root = R } = ar_tx:generate_chunk_tree(TX),
+				R;
+			Existing ->
+				Existing
+		end,
+	Stub = TX#tx{
+		format = 2,
+		data = <<>>,
+		signature = <<>>,
+		owner = <<>>,
+		data_root = DataRoot
+	},
 	ar_kv:put(tombstone_db, TX#tx.id, ar_serialize:tx_to_binary(Stub)).
 
 %% @doc Only write a tombstone if the tx is on the sticky/programmatic

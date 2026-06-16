@@ -241,8 +241,21 @@ do_join(Peers, B, BI) ->
 	Trail = lists:sublist(tl(BI), 2 * ar_block:get_max_tx_anchor_depth()),
 	SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(B#block.txs, B#block.height),
 	Retries = lists:foldl(fun(Peer, Acc) -> maps:put(Peer, 5, Acc) end, #{}, Peers),
-	Blocks = [B#block{ size_tagged_txs = SizeTaggedTXs }
-			| get_block_trail(WorkerQ, PeerQ, Trail, Retries)],
+	Blocks =
+		try
+			[B#block{ size_tagged_txs = SizeTaggedTXs }
+					| get_block_trail(WorkerQ, PeerQ, Trail, Retries)]
+		catch
+			throw:{unauthorised_tombstone, _TXID} ->
+				ar:console(
+					"JOIN refused — one or more peers served a tombstone "
+					"that no Admin-Delete tx in the trail authorises. "
+					"Trying a different peer set is the recovery path.~n",
+					[]),
+				timer:sleep(1000),
+				init:stop(1),
+				receive after infinity -> ok end
+		end,
 	ar:console("Downloaded the block trail successfully.~n", []),
 	Blocks2 = maybe_set_reward_history(Blocks, Peers),
 	Blocks3 = maybe_set_block_time_history(Blocks2, Peers),
@@ -377,6 +390,27 @@ get_block_trail_loop(WorkerQ, PeerQ, Retries, Trail, FetchState) ->
 				_ ->
 					get_block_trail_loop(WorkerQ, PeerQ, Retries, Trail, FetchState3)
 			end;
+		{tx_response, H, TXID, _Peer, {pending_tombstone, #tx{} = Stub}, peer} ->
+			%% Same accounting as a regular tx_response, but the stub
+			%% is wrapped so get_blocks/2 can cross-check it against
+			%% the trail's Admin-Delete txs before unwrapping.
+			{BShadow, TXMap, AwaitingTXCount} = maps:get(H, FetchState),
+			TXMap2 = maps:put(TXID, {pending_tombstone, Stub}, TXMap),
+			AwaitingTXCount2 = AwaitingTXCount - 1,
+			FetchState2 = maps:put(H, {BShadow, TXMap2, AwaitingTXCount2}, FetchState),
+			AwaitingBlockCount = maps:get(awaiting_block_count, FetchState2),
+			AwaitingBlockCount2 =
+				case AwaitingTXCount2 of
+					0 -> AwaitingBlockCount - 1;
+					_ -> AwaitingBlockCount
+				end,
+			FetchState3 = maps:put(awaiting_block_count, AwaitingBlockCount2, FetchState2),
+			case AwaitingBlockCount2 of
+				0 ->
+					get_blocks(Trail, FetchState3);
+				_ ->
+					get_block_trail_loop(WorkerQ, PeerQ, Retries, Trail, FetchState3)
+			end;
 		{tx_response, H, TXID, Peer, Response, peer} ->
 			PeerRetries = maps:get(Peer, Retries),
 			case PeerRetries > 0 of
@@ -439,13 +473,70 @@ request_tx(H, TXID, WorkerQ, PeerQ) ->
 	W ! {get_tx, H, TXID, Peer, self()},
 	{queue:in(W, WorkerQ2), queue:in(Peer, PeerQ2)}.
 
-get_blocks([], _FetchState) ->
+get_blocks(Trail, FetchState) ->
+	%% Build the trusted-deletions set from Admin-Delete txs that appear
+	%% anywhere in the trail. An Admin-Delete tx is signed by the admin
+	%% wallet and was verified by verify_tx_id when it arrived from the
+	%% peer, so its Target-TX tag is trustworthy — anything else is a
+	%% peer-forged tombstone and we must not accept it.
+	TrustedDeletions = collect_trusted_deletions(Trail, FetchState),
+	do_get_blocks(Trail, FetchState, TrustedDeletions).
+
+collect_trusted_deletions(Trail, FetchState) ->
+	lists:foldl(
+		fun({H, _, _}, Acc) ->
+			{_, TXMap, _} = maps:get(H, FetchState),
+			maps:fold(
+				fun(_TXID, #tx{ tags = Tags }, A) ->
+						case lists:keyfind(<<"Type">>, 1, Tags) of
+							{_, <<"Admin-Delete">>} ->
+								case lists:keyfind(<<"Target-TX">>, 1, Tags) of
+									{_, Encoded} ->
+										case catch ar_util:decode(Encoded) of
+											D when is_binary(D), byte_size(D) =:= 32 ->
+												sets:add_element(D, A);
+											_ -> A
+										end;
+									_ -> A
+								end;
+							_ -> A
+						end;
+				   (_, _, A) -> A
+				end, Acc, TXMap)
+		end, sets:new(), Trail).
+
+do_get_blocks([], _FetchState, _TrustedDeletions) ->
 	[];
-get_blocks([{H, _, _} | Trail], FetchState) ->
+do_get_blocks([{H, _, _} | Trail], FetchState, TrustedDeletions) ->
 	{B, TXMap, _} = maps:get(H, FetchState),
-	TXs = [maps:get(TXID, TXMap) || TXID <- B#block.txs],
+	TXs = [unwrap_tx(maps:get(TXID, TXMap), TXID, TrustedDeletions)
+			|| TXID <- B#block.txs],
 	SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(TXs, B#block.height),
-	[B#block{ txs = TXs, size_tagged_txs = SizeTaggedTXs } | get_blocks(Trail, FetchState)].
+	[B#block{ txs = TXs, size_tagged_txs = SizeTaggedTXs }
+			| do_get_blocks(Trail, FetchState, TrustedDeletions)].
+
+unwrap_tx({pending_tombstone, #tx{} = Stub}, TXID, TrustedDeletions) ->
+	case sets:is_element(TXID, TrustedDeletions) of
+		true ->
+			?LOG_INFO([{event, accepted_trail_verified_tombstone},
+					{tx, ar_util:encode(TXID)}]),
+			catch ar_storage:write_tombstone(Stub),
+			Stub;
+		false ->
+			ar:console("A peer served a tombstone for tx ~s without an "
+					"authorising Admin-Delete tx in the trail. "
+					"Aborting JOIN.~n", [ar_util:encode(TXID)]),
+			?LOG_ERROR([{event, rejected_unauthorised_tombstone},
+					{tx, ar_util:encode(TXID)}]),
+			%% Throw — caught in do_join/3 below, which then calls
+			%% init:stop synchronously. init:stop is async so calling
+			%% it directly here would let the foldl in
+			%% generate_size_tagged_list_from_txs run past the
+			%% non-tx return value and crash with badrecord.
+			throw({unauthorised_tombstone, TXID})
+	end;
+unwrap_tx(#tx{} = TX, _TXID, _TrustedDeletions) ->
+	TX.
 
 request_block(H, WorkerQ, PeerQ) ->
 	{{value, W}, WorkerQ2} = queue:out(WorkerQ),
@@ -517,6 +608,14 @@ worker() ->
 					From ! {tx_response, H, TXID, Peer, TX, storage};
 				unavailable ->
 					case ar_http_iface_client:get_tx_from_remote_peer(Peer, TXID, true) of
+						{{tombstone, Stub}, _, _, _} ->
+							%% Park the stub in TXMap under a guarded
+							%% wrapper. The trail validation pass
+							%% before get_blocks/2 either unwraps it
+							%% (Admin-Delete found in trail) or fails
+							%% the JOIN.
+							From ! {tx_response, H, TXID, Peer,
+									{pending_tombstone, Stub}, peer};
 						{TX, _, _, _} ->
 							From ! {tx_response, H, TXID, Peer, TX, peer};
 						Error ->

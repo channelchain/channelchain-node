@@ -151,6 +151,13 @@ download_and_verify_tx(TXID, TXIDPeer) ->
 					{txid, ar_util:encode(TXID)},
 					{txid_peer, ar_util:format_peer(TXIDPeer)}
 			]);
+		{{tombstone, _Stub}, _, _, _} ->
+			%% A peer returned an on-chain Admin-Delete tombstone. The
+			%% tx is irrecoverable by design — stop polling for it and
+			%% keep the ignore registry entry so we don't immediately
+			%% re-queue.
+			ar_ignore_registry:remove_ref(TXID, Ref),
+			ar_ignore_registry:add_temporary(TXID, 10 * 60 * 1000);
 		{TX, Peer, Time, Size} ->
 			case ar_tx_validator:validate(TX) of
 				{invalid, Code} ->

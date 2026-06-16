@@ -1198,6 +1198,14 @@ get_tx_from_disk_or_peers(Peers, TXID) ->
 			case get_tx_from_remote_peers(Peers, TXID) of
 				not_found ->
 					not_found;
+				{{tombstone, Stub}, _Peer, _Time, _Size} ->
+					%% Unwrap for legacy callers (ar_node_worker's
+					%% fold, ar_header_sync's get_txs) that only know
+					%% how to consume #tx{} or not_found. The Stub is
+					%% a valid #tx{} with data/signature stripped.
+					%% Callers that want to distinguish should use
+					%% get_tx_from_remote_peer(s)/3 directly.
+					Stub;
 				{TX, _Peer, _Time, _Size} ->
 					TX
 			end;
@@ -1215,6 +1223,11 @@ get_tx_from_remote_peers(Peers, TXID, RatePeer) ->
 	case get_tx_from_remote_peer(Peer, TXID, RatePeer) of
 		{#tx{} = TX, Peer, Time, Size} ->
 			{TX, Peer, Time, Size};
+		{{tombstone, _Stub}, _, _, _} = TombstoneResp ->
+			%% Tombstoned by Admin-Delete — peer is honest, the tx is
+			%% just gone for good. Returning it lets callers (e.g.
+			%% ar_tx_poller) stop chasing it across the swarm.
+			TombstoneResp;
 		_ ->
 			get_tx_from_remote_peers(Peers -- [Peer], TXID, RatePeer)
 	end.
@@ -1253,20 +1266,18 @@ get_tx_from_remote_peer(Peer, TXID, RatePeer) ->
 					{TX, Peer, Time, Size}
 			end;
 		{ok, {tombstone, #tx{ id = StubID } = Stub}, Time, Size} when StubID =:= TXID ->
-			%% Peer holds an on-chain Admin-Delete tombstone for this tx.
-			%% Body and signature are gone; data_root / tags are preserved
-			%% so the joiner can still rebuild B#block.txs and validate
-			%% the block tx_root. Skip the signature/PoW check — the
-			%% original tx is, by definition, unreconstructable.
-			?LOG_INFO([{event, accepted_tombstone_tx},
+			%% Peer says this tx is gone via on-chain Admin-Delete. We
+			%% can't verify the stub itself (data and signature are gone
+			%% by construction), so a malicious peer could forge a
+			%% deletion claim. Defer trust to the caller: ar_join
+			%% cross-checks every tombstone against an authorising
+			%% Admin-Delete tx that lives elsewhere in the same trail.
+			%% Plain (non-JOIN) consumers receive the marker too — they
+			%% can decide whether to accept it.
+			?LOG_INFO([{event, received_unverified_tombstone},
 					{peer, ar_util:format_peer(Peer)},
 					{tx, ar_util:encode(TXID)}]),
-			%% Persist the tombstone locally so subsequent queries to
-			%% this node return 410 + the same stub instead of 404 —
-			%% keeps the deletion semantic propagating instead of just
-			%% the trail validity.
-			catch ar_storage:write_tombstone(Stub),
-			{Stub, Peer, Time, Size};
+			{{tombstone, Stub}, Peer, Time, Size};
 		{ok, {tombstone, _Stub}, _Time, _Size} ->
 			ar_peers:issue_warning(Peer, tx, tombstone_id_mismatch),
 			{error, invalid_tx};
