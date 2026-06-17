@@ -205,9 +205,23 @@ get_block(Peers, H, Retries) ->
 get_block(_Peers, BShadow, [], TXs, _Retries) ->
 	BShadow#block{ txs = lists:reverse(TXs) };
 get_block(Peers, BShadow, [TXID | TXIDs], TXs, Retries) ->
-	case ar_http_iface_client:get_tx(Peers, TXID) of
-		#tx{} = TX ->
+	%% Use get_tx_from_remote_peers/3 (not get_tx/2) so the response can
+	%% surface a 410 + x-tombstone:1 reply as {tombstone, Stub}. get_tx
+	%% goes through get_tx_from_disk_or_peers, whose post-JOIN
+	%% tombstone gate returns not_found until build_index_complete
+	%% flips — at JOIN time the flag is necessarily false, so a tip
+	%% block that carries a deleted tx would otherwise retry 10x and
+	%% init:stop the joiner (Reviewer's regression call-out on
+	%% fb194032). Park the tombstone as {pending_tombstone, Stub} the
+	%% same way the trail worker does; get_blocks/2 validates and
+	%% unwraps it later, after collect_trusted_deletions has seen the
+	%% authorising Admin-Delete tx from the trail.
+	case ar_http_iface_client:get_tx_from_remote_peers(Peers, TXID, true) of
+		{#tx{} = TX, _Peer, _Time, _Size} ->
 			get_block(Peers, BShadow, TXIDs, [TX | TXs], Retries);
+		{{tombstone, #tx{} = Stub}, _Peer, _Time, _Size} ->
+			get_block(Peers, BShadow, TXIDs,
+					[{pending_tombstone, Stub} | TXs], Retries);
 		_ ->
 			case Retries > 0 of
 				true ->
@@ -243,12 +257,16 @@ do_join(Peers, B, BI) ->
 			|| _ <- lists:seq(1, Config#config.join_workers)]),
 	PeerQ = queue:from_list(Peers),
 	Trail = lists:sublist(tl(BI), 2 * ar_block:get_max_tx_anchor_depth()),
-	SizeTaggedTXs = ar_block:generate_size_tagged_list_from_txs(B#block.txs, B#block.height),
 	Retries = lists:foldl(fun(Peer, Acc) -> maps:put(Peer, 5, Acc) end, #{}, Peers),
+	%% SizeTaggedTXs for the tip block is computed inside get_blocks/2,
+	%% *after* the trail has been fetched. The tip's TXs may include
+	%% {pending_tombstone, Stub} wrappers from get_block/4 above, and we
+	%% need TrustedDeletions (which spans tip + trail) before we can
+	%% unwrap them. get_block_trail therefore returns the *whole*
+	%% Blocks list (tip first, then trail), not just the trail.
 	Blocks =
 		try
-			[B#block{ size_tagged_txs = SizeTaggedTXs }
-					| get_block_trail(WorkerQ, PeerQ, Trail, Retries, B)]
+			get_block_trail(WorkerQ, PeerQ, Trail, Retries, B)
 		catch
 			throw:{unauthorised_tombstone, _TXID} ->
 				ar:console(
@@ -274,13 +292,19 @@ do_join(Peers, B, BI) ->
 %% can validate transactions even if it enters a ar_block:get_max_tx_anchor_depth()-deep
 %% fork recovery (which is the deepest fork recovery possible) immediately after
 %% joining the network.
-get_block_trail(_WorkerQ, _PeerQ, [], _Retries, _TipBlock) ->
-	[];
+get_block_trail(_WorkerQ, _PeerQ, [], _Retries, TipBlock) ->
+	%% Even with an empty trail (genesis-only chain) the tip block
+	%% may carry a tombstone wrapper from get_block/4 that needs
+	%% TrustedDeletions-based unwrapping. Go through get_blocks/2 so
+	%% that finalisation runs.
+	FetchState = #{ awaiting_block_count => 0, tip_block => TipBlock },
+	get_blocks([], FetchState);
 get_block_trail(WorkerQ, PeerQ, Trail, Retries, TipBlock) ->
 	{WorkerQ2, PeerQ2} = request_blocks(Trail, WorkerQ, PeerQ),
 	%% Carry the tip block in FetchState so collect_trusted_deletions
-	%% can include its Admin-Delete txs in the trusted set without
-	%% threading a new parameter through every receive clause.
+	%% can include its Admin-Delete txs in the trusted set, and so
+	%% get_blocks/2 can unwrap any pending_tombstone wrappers on its
+	%% tx list before computing SizeTaggedTXs.
 	FetchState = #{ awaiting_block_count => length(Trail),
 			tip_block => TipBlock },
 	get_block_trail_loop(WorkerQ2, PeerQ2, Retries, Trail, FetchState).
@@ -493,14 +517,34 @@ get_blocks(Trail, FetchState) ->
 	%% not in their possession), so collect_trusted_deletions reduces
 	%% peer trust to "the admin actually authorised this deletion".
 	AdminAddresses = ar_admin:get_join_time_admin_addresses(),
-	TipTXMap =
+	TipBlock =
 		case maps:find(tip_block, FetchState) of
-			{ok, #block{} = B} -> block_txs_to_txmap(B);
-			_ -> #{}
+			{ok, #block{} = B0} -> B0;
+			_ -> #block{}
 		end,
+	TipTXMap = block_txs_to_txmap(TipBlock),
 	TrustedDeletions = collect_trusted_deletions(
 			AdminAddresses, [TipTXMap | trail_txmaps(Trail, FetchState)]),
-	do_get_blocks(Trail, FetchState, TrustedDeletions).
+	%% Tip block may carry {pending_tombstone, Stub} wrappers from
+	%% get_block/4. Validate them against the same TrustedDeletions
+	%% set the trail uses, then compute SizeTaggedTXs. Doing this here
+	%% (instead of in do_join, before the trail was fetched) is what
+	%% makes a tip-block tombstone safe to cross without falling into
+	%% the legacy gate's defer → not_found → 10×retry → init:stop loop.
+	UnwrappedTipTXs = [unwrap_tx(TXOrWrap, tx_id_of(TXOrWrap), TrustedDeletions)
+			|| TXOrWrap <- TipBlock#block.txs],
+	TipSizeTagged = ar_block:generate_size_tagged_list_from_txs(
+			UnwrappedTipTXs, TipBlock#block.height),
+	TipFinal = TipBlock#block{
+		txs = UnwrappedTipTXs,
+		size_tagged_txs = TipSizeTagged
+	},
+	[TipFinal | do_get_blocks(Trail, FetchState, TrustedDeletions)].
+
+%% @doc Return the TXID for either a real #tx{} or our
+%% {pending_tombstone, Stub} wrapper. Used by the tip-block unwrap pass.
+tx_id_of(#tx{ id = ID }) -> ID;
+tx_id_of({pending_tombstone, #tx{ id = ID }}) -> ID.
 
 %% @doc Walk the trail and pull each block's TXMap out of FetchState. A
 %% missing entry would otherwise badkey-crash the foldl and bypass the

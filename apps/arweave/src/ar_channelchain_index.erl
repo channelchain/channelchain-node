@@ -12,7 +12,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0, add_tx/1, query/1, is_deleted/1, is_rewritten/1,
+-export([start_link/0, add_tx/1, add_confirmed_tx/1, query/1, is_deleted/1, is_rewritten/1,
          resolve_effective_tx/1, get_replacement_tx/1,
          board_stats/1, thread_stats/1, is_build_index_complete/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -39,6 +39,16 @@ start_link() ->
 %% @doc Add a TX to the index (called when a new TX arrives).
 add_tx(TX) when is_record(TX, tx) ->
     gen_server:cast(?MODULE, {add_tx, TX}).
+
+%% @doc Add a confirmed TX to the index. Used by ar_header_sync when it
+%% backfills a block that the post-JOIN build_index pass missed (the
+%% block wasn't on disk yet when build_from_chain ran). Without this
+%% incremental hook, an Admin-Delete tx in a backfilled block would
+%% stay out of ?DELETED_TXS_TABLE and the legacy tombstone gate would
+%% reject any tombstone for one of that block's other txs forever,
+%% stalling the backfill.
+add_confirmed_tx(TX) when is_record(TX, tx) ->
+    gen_server:cast(?MODULE, {add_confirmed_tx, TX}).
 
 %% @doc Query TXs by tag filters.
 %% Filters is a map: #{"type" => "Board", "board_id" => "...", etc.}
@@ -139,6 +149,10 @@ handle_call(_Request, _From, State) ->
 
 handle_cast({add_tx, TX}, State) ->
     maybe_index_tx(TX, unconfirmed),
+    {noreply, State};
+
+handle_cast({add_confirmed_tx, TX}, State) ->
+    maybe_index_tx(TX, confirmed),
     {noreply, State};
 
 handle_cast(build_index, State) ->

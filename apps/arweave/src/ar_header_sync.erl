@@ -389,6 +389,22 @@ add_block2(B, #state{ sync_record = SyncRecord, retry_record = RetryRecord } = S
 	#block{ indep_hash = H, previous_block = PrevH, height = Height } = B,
 	case ar_storage:write_full_block(B, B#block.txs) of
 		ok ->
+			%% Incrementally index this backfilled block's ChannelChain
+			%% txs. Without this hook, a block fetched by header_sync
+			%% *after* the post-JOIN build_index pass would keep its
+			%% Admin-Delete txs out of ?DELETED_TXS_TABLE /
+			%% ar_tx_blacklist_programmatic, so a tombstone served for
+			%% one of its txs would land on the legacy-path gate as
+			%% reject (replay_complete=true, but not_in_index) and
+			%% block backfill of that block forever. The hook keeps
+			%% the gate's "deletion authorised by this very chain"
+			%% invariant true incrementally as blocks land.
+			lists:foreach(
+				fun(#tx{} = TX) ->
+						catch ar_channelchain_index:add_confirmed_tx(TX);
+				   (_) ->
+						ok
+				end, B#block.txs),
 			case ar_intervals:is_inside(SyncRecord, Height) of
 				true ->
 					{ok, State};
