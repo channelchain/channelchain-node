@@ -544,10 +544,29 @@ collect_trusted_deletions(AdminAddresses, TXMaps) ->
 %% authorised by an admin: it has the Type=Admin-Delete tag, a
 %% well-formed 32-byte Target-TX, a non-empty signature (rejects the
 %% PoW-only anonymous path entirely for admin actions), and the
-%% recovered owner address is in admin_addresses. verify_tx_id earlier
-%% in the JOIN fetch already validated the RSA signature when present,
-%% so owner ∈ admin_addresses + signature =/= <<>> is a sufficient
-%% proof of authorisation.
+%% recovered owner address is in admin_addresses.
+%%
+%% LOAD-BEARING INVARIANT (do not change without re-auditing):
+%%   Every TX in TXMap here has already passed
+%%   ar_tx:verify_tx_id/2 in ar_http_iface_client:get_tx_from_remote_peer
+%%   (the 200 / 410 branches both call it, and a tombstone is wrapped
+%%   as {pending_tombstone, _} which never reaches this function — only
+%%   real #tx{} records do).
+%%
+%%   That earlier verify_signature_v{1,2} step is what makes
+%%   "signature =/= <<>> + owner ∈ admin_addresses" sufficient: an
+%%   attacker can forge owner = <admin_pubkey> (it's public), but they
+%%   can't forge a valid RSA signature, so the only TXs that reach
+%%   this function with a non-empty signature are the ones the chain
+%%   itself accepts as admin-signed. Anonymous PoW-gated txs are
+%%   explicitly rejected at the signature check below, which closes
+%%   the 258aeb29 anonymous-acceptance path against trail-injection
+%%   attacks.
+%%
+%%   If a future change ever lets unverified TXs into the joiner's
+%%   TXMap (e.g. a new fetch path that skips verify_tx_id), this
+%%   function becomes unsound and the gate has to recover the safety
+%%   margin some other way (re-verify here, or refuse pre-verified).
 is_admin_delete_authorising(#tx{ tags = Tags } = TX, AdminAddresses) ->
 	case lists:keyfind(<<"Type">>, 1, Tags) of
 		{_, <<"Admin-Delete">>} ->

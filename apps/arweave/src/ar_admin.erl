@@ -614,10 +614,29 @@ get_admin_addresses() ->
 %% record returned by arweave_config:get_env/0), so this is consistent
 %% with initial_state/0's logic above and works from the very first
 %% line of do_join/3.
+%%
+%% Fail-closed contract: when the genesis config is missing or the
+%% admin list is empty we return [] and emit a warning. The downstream
+%% gate (ar_join:is_admin_delete_authorising/2) then treats every
+%% tombstone-bearing trail as unauthorised, so the JOIN refuses rather
+%% than silently accepting forged deletions. Operators see the warning
+%% and fix the config; the alternative (defaulting to "accept all
+%% deletions") would be silently catastrophic.
 get_join_time_admin_addresses() ->
 	Config = read_genesis_config(),
 	Raw = get_configured_admin_addresses(Config),
-	lists:usort([decode_address(A) || A <- Raw]).
+	Decoded = lists:usort([decode_address(A) || A <- Raw]),
+	case Decoded of
+		[] ->
+			?LOG_WARNING([{event, join_time_admin_addresses_empty},
+					{action, fail_closed_for_admin_delete},
+					{hint, "genesis config missing or admin_addresses list "
+							"empty — JOIN will refuse any trail that "
+							"references an Admin-Delete tx"}]);
+		_ ->
+			ok
+	end,
+	Decoded.
 
 get_wallet_roles() ->
 	case ets:lookup(node_state, wallet_roles) of

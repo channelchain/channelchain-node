@@ -14,7 +14,7 @@
 
 -export([start_link/0, add_tx/1, query/1, is_deleted/1, is_rewritten/1,
          resolve_effective_tx/1, get_replacement_tx/1,
-         board_stats/1, thread_stats/1]).
+         board_stats/1, thread_stats/1, is_build_index_complete/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -include_lib("arweave/include/ar.hrl").
@@ -25,6 +25,8 @@
 -define(DELETED_TXS_TABLE, channelchain_deleted_txs).
 -define(TX_RECORDS_TABLE, channelchain_tx_records).  %% Full TX records for admin TXs
 -define(REWRITTEN_TXS_TABLE, channelchain_rewritten_txs). %% {OldTXID, ReplacementTXID}
+-define(STATE_TABLE, channelchain_index_state). %% Build-state flags consumed by callers
+%% e.g. ar_http_iface_client's tombstone trust gate
 -define(APP_NAME, <<"ChannelChain">>).
 
 %%%===================================================================
@@ -46,6 +48,16 @@ query(Filters) ->
 %% @doc Check if a TX is marked as deleted.
 is_deleted(TXID) ->
     ets:member(?DELETED_TXS_TABLE, TXID).
+
+%% @doc Has build_index finished at least once since startup? Callers use
+%% this as a race-free signal to switch their behaviour after the
+%% channelchain replay populates the deletion / blacklist sets.
+%% Returns false during early startup before the ets table exists.
+is_build_index_complete() ->
+    try ets:lookup(?STATE_TABLE, build_index_complete) of
+        [{build_index_complete, true}] -> true;
+        _ -> false
+    catch _:_ -> false end.
 
 %% @doc Check if a TX has been rewritten (replaced).
 is_rewritten(TXID) ->
@@ -91,6 +103,8 @@ init([]) ->
         [set, public, named_table, {read_concurrency, true}]),
     ets:new(?REWRITTEN_TXS_TABLE,
         [set, public, named_table, {read_concurrency, true}]),
+    ets:new(?STATE_TABLE,
+        [set, public, named_table, {read_concurrency, true}]),
     %% Subscribe to tx events (new TX received by node)
     ar_events:subscribe(tx),
     %% Subscribe to block events (TX confirmed in block)
@@ -132,6 +146,23 @@ handle_cast(build_index, State) ->
     %% We scan the mempool and confirmed TX files.
     build_from_mempool(),
     build_from_chain(),
+    %% Mark replay as complete IFF we actually replayed a non-empty
+    %% chain. The init/1 cast runs before JOIN downloads any blocks,
+    %% so the very first invocation typically finds an empty
+    %% block_index — flipping the flag at that point would let the
+    %% post-JOIN tombstone gate switch from "defer" to "reject"
+    %% before any blocks have been written, mis-rejecting trail
+    %% tombstones for txs whose authorising Admin-Delete just
+    %% hasn't been processed yet. We only mark complete once
+    %% there is a chain to replay; the post-JOIN cast_after pair
+    %% in handle_info({initialized,_}) ensures we re-enter here
+    %% with a populated block_index.
+    case ets:info(?TX_TAGS_TABLE, size) of
+        N when is_integer(N), N > 0 ->
+            ets:insert(?STATE_TABLE, {build_index_complete, true});
+        _ ->
+            ok
+    end,
     {noreply, State};
 
 handle_cast(_Msg, State) ->
