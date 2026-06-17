@@ -2,6 +2,10 @@
 
 -export([start/1]).
 
+%% Test helpers — exported so EUnit + ad-hoc verification can drive the
+%% tombstone trust gate without spinning up a full JOIN.
+-export([collect_trusted_deletions/2, is_admin_delete_authorising/2]).
+
 -include("ar.hrl").
 -include_lib("arweave_config/include/arweave_config.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -244,7 +248,7 @@ do_join(Peers, B, BI) ->
 	Blocks =
 		try
 			[B#block{ size_tagged_txs = SizeTaggedTXs }
-					| get_block_trail(WorkerQ, PeerQ, Trail, Retries)]
+					| get_block_trail(WorkerQ, PeerQ, Trail, Retries, B)]
 		catch
 			throw:{unauthorised_tombstone, _TXID} ->
 				ar:console(
@@ -270,11 +274,15 @@ do_join(Peers, B, BI) ->
 %% can validate transactions even if it enters a ar_block:get_max_tx_anchor_depth()-deep
 %% fork recovery (which is the deepest fork recovery possible) immediately after
 %% joining the network.
-get_block_trail(_WorkerQ, _PeerQ, [], _Retries) ->
+get_block_trail(_WorkerQ, _PeerQ, [], _Retries, _TipBlock) ->
 	[];
-get_block_trail(WorkerQ, PeerQ, Trail, Retries) ->
+get_block_trail(WorkerQ, PeerQ, Trail, Retries, TipBlock) ->
 	{WorkerQ2, PeerQ2} = request_blocks(Trail, WorkerQ, PeerQ),
-	FetchState = #{ awaiting_block_count => length(Trail) },
+	%% Carry the tip block in FetchState so collect_trusted_deletions
+	%% can include its Admin-Delete txs in the trusted set without
+	%% threading a new parameter through every receive clause.
+	FetchState = #{ awaiting_block_count => length(Trail),
+			tip_block => TipBlock },
 	get_block_trail_loop(WorkerQ2, PeerQ2, Retries, Trail, FetchState).
 
 request_blocks([], WorkerQ, PeerQ) ->
@@ -475,35 +483,94 @@ request_tx(H, TXID, WorkerQ, PeerQ) ->
 
 get_blocks(Trail, FetchState) ->
 	%% Build the trusted-deletions set from Admin-Delete txs that appear
-	%% anywhere in the trail. An Admin-Delete tx is signed by the admin
-	%% wallet and was verified by verify_tx_id when it arrived from the
-	%% peer, so its Target-TX tag is trustworthy — anything else is a
-	%% peer-forged tombstone and we must not accept it.
-	TrustedDeletions = collect_trusted_deletions(Trail, FetchState),
+	%% anywhere in the trail or the tip block. verify_tx_id alone is NOT
+	%% enough to trust the deletion claim — the anonymous-tx acceptance
+	%% path (258aeb29) lets a peer post a PoW-valid tx tagged
+	%% Type=Admin-Delete with an arbitrary Target-TX. We must therefore
+	%% require the same gate ar_node_worker enforces on incoming admin
+	%% txs: a non-empty RSA signature whose owner address is in
+	%% admin_addresses. The peer can't fake that (admin private key is
+	%% not in their possession), so collect_trusted_deletions reduces
+	%% peer trust to "the admin actually authorised this deletion".
+	AdminAddresses = ar_admin:get_join_time_admin_addresses(),
+	TipTXMap =
+		case maps:find(tip_block, FetchState) of
+			{ok, #block{} = B} -> block_txs_to_txmap(B);
+			_ -> #{}
+		end,
+	TrustedDeletions = collect_trusted_deletions(
+			AdminAddresses, [TipTXMap | trail_txmaps(Trail, FetchState)]),
 	do_get_blocks(Trail, FetchState, TrustedDeletions).
 
-collect_trusted_deletions(Trail, FetchState) ->
+%% @doc Walk the trail and pull each block's TXMap out of FetchState. A
+%% missing entry would otherwise badkey-crash the foldl and bypass the
+%% throw:{unauthorised_tombstone,_} catch in do_join/3, taking the
+%% whole node down via an uncaught error.
+trail_txmaps(Trail, FetchState) ->
+	lists:filtermap(
+		fun({H, _, _}) ->
+			case maps:find(H, FetchState) of
+				{ok, {_, TXMap, _}} -> {true, TXMap};
+				error -> false
+			end
+		end, Trail).
+
+%% @doc Turn the tip block's already-fetched #tx{} list into the same
+%% TXID → TX shape used in FetchState's TXMaps, so collect_trusted_deletions
+%% can scan it uniformly. The tip block is fetched separately by start2/1
+%% (it carries the head block's txs in B#tx{}-records form) and never
+%% enters the trail's get_block_trail_loop pipeline.
+block_txs_to_txmap(#block{ txs = TXs }) ->
 	lists:foldl(
-		fun({H, _, _}, Acc) ->
-			{_, TXMap, _} = maps:get(H, FetchState),
+		fun (#tx{ id = ID } = TX, Acc) -> maps:put(ID, TX, Acc);
+			(_, Acc) -> Acc
+		end, #{}, TXs).
+
+collect_trusted_deletions(AdminAddresses, TXMaps) ->
+	lists:foldl(
+		fun(TXMap, Acc) ->
 			maps:fold(
-				fun(_TXID, #tx{ tags = Tags }, A) ->
-						case lists:keyfind(<<"Type">>, 1, Tags) of
-							{_, <<"Admin-Delete">>} ->
-								case lists:keyfind(<<"Target-TX">>, 1, Tags) of
-									{_, Encoded} ->
-										case catch ar_util:decode(Encoded) of
-											D when is_binary(D), byte_size(D) =:= 32 ->
-												sets:add_element(D, A);
-											_ -> A
-										end;
-									_ -> A
-								end;
-							_ -> A
+				fun (_TXID, TX, A) when is_record(TX, tx) ->
+						case is_admin_delete_authorising(TX, AdminAddresses) of
+							{true, Target} -> sets:add_element(Target, A);
+							false -> A
 						end;
-				   (_, _, A) -> A
+				    (_, _, A) ->
+						A
 				end, Acc, TXMap)
-		end, sets:new(), Trail).
+		end, sets:new(), TXMaps).
+
+%% @doc Return {true, TargetTXID} only when TX is a genuine Admin-Delete
+%% authorised by an admin: it has the Type=Admin-Delete tag, a
+%% well-formed 32-byte Target-TX, a non-empty signature (rejects the
+%% PoW-only anonymous path entirely for admin actions), and the
+%% recovered owner address is in admin_addresses. verify_tx_id earlier
+%% in the JOIN fetch already validated the RSA signature when present,
+%% so owner ∈ admin_addresses + signature =/= <<>> is a sufficient
+%% proof of authorisation.
+is_admin_delete_authorising(#tx{ tags = Tags } = TX, AdminAddresses) ->
+	case lists:keyfind(<<"Type">>, 1, Tags) of
+		{_, <<"Admin-Delete">>} ->
+			case TX#tx.signature of
+				<<>> ->
+					false;
+				_ ->
+					case lists:keyfind(<<"Target-TX">>, 1, Tags) of
+						{_, Encoded} ->
+							case catch ar_util:decode(Encoded) of
+								D when is_binary(D), byte_size(D) =:= 32 ->
+									OwnerAddr = ar_tx:get_owner_address(TX),
+									case lists:member(OwnerAddr, AdminAddresses) of
+										true -> {true, D};
+										false -> false
+									end;
+								_ -> false
+							end;
+						_ -> false
+					end
+			end;
+		_ -> false
+	end.
 
 do_get_blocks([], _FetchState, _TrustedDeletions) ->
 	[];

@@ -15,6 +15,7 @@
 	apply_admin_txs/2,
 	get_admin_cost/1,
 	get_admin_addresses/0,
+	get_join_time_admin_addresses/0,
 	get_wallet_roles/0,
 	get_wallet_capabilities/0,
 	get_admin_pool_balance/0,
@@ -604,6 +605,19 @@ get_admin_addresses() ->
 		[{admin_addresses, Addresses}] -> Addresses;
 		[] -> element(1, initial_state())
 	end.
+
+%% @doc Return the decoded admin addresses without requiring node_state to
+%% be populated. Used by ar_join while the trail is being downloaded —
+%% node_state's admin_addresses entry isn't written until JOIN finishes,
+%% so the regular get_admin_addresses/0 returns the empty initial state.
+%% The source is the genesis JSON config (not the legacy #config{}
+%% record returned by arweave_config:get_env/0), so this is consistent
+%% with initial_state/0's logic above and works from the very first
+%% line of do_join/3.
+get_join_time_admin_addresses() ->
+	Config = read_genesis_config(),
+	Raw = get_configured_admin_addresses(Config),
+	lists:usort([decode_address(A) || A <- Raw]).
 
 get_wallet_roles() ->
 	case ets:lookup(node_state, wallet_roles) of

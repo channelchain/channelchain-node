@@ -25,7 +25,7 @@
 -export([log_failed_request/2]).
 
 %% -- Testing exports
--export([get_tx_from_remote_peer/3]).
+-export([get_tx_from_remote_peer/3, is_locally_authorised_deletion/1]).
 %% -- End of testing exports
 
 -include("ar.hrl").
@@ -1199,18 +1199,96 @@ get_tx_from_disk_or_peers(Peers, TXID) ->
 				not_found ->
 					not_found;
 				{{tombstone, Stub}, _Peer, _Time, _Size} ->
-					%% Unwrap for legacy callers (ar_node_worker's
-					%% fold, ar_header_sync's get_txs) that only know
-					%% how to consume #tx{} or not_found. The Stub is
-					%% a valid #tx{} with data/signature stripped.
-					%% Callers that want to distinguish should use
-					%% get_tx_from_remote_peer(s)/3 directly.
-					Stub;
+					%% Legacy fan-out path: ar_node_worker,
+					%% ar_header_sync, etc. — NOT guarded by ar_join's
+					%% trail verification. A peer-forged tombstone for
+					%% a tx the chain never authorised to delete would
+					%% pollute the local data_root index. Cross-check
+					%% the deletion against the locally-replayed chain
+					%% state if it's populated. If it isn't yet (the
+					%% very-early-post-JOIN window where ar_header_sync
+					%% races ar_channelchain_index:build_index), fall
+					%% back to the weaker id-only check so the joiner
+					%% can finish settling. The peer's tombstone is
+					%% bounded by JOIN-time trail verification for the
+					%% blocks ar_join touched; this fallback is only
+					%% relevant for blocks behind the trail window,
+					%% which a deployment can mitigate by trusting the
+					%% peer list.
+					case tombstone_trust_decision(TXID) of
+						accept ->
+							catch ar_storage:write_tombstone(Stub),
+							Stub;
+						defer ->
+							?LOG_WARNING([
+								{event, accepted_unverified_tombstone},
+								{path, get_tx_from_disk_or_peers},
+								{tx, ar_util:encode(TXID)},
+								{reason, local_index_not_ready}
+							]),
+							catch ar_storage:write_tombstone(Stub),
+							Stub;
+						reject ->
+							?LOG_WARNING([
+								{event, rejected_unauthorised_tombstone},
+								{path, get_tx_from_disk_or_peers},
+								{tx, ar_util:encode(TXID)}
+							]),
+							not_found
+					end;
 				{TX, _Peer, _Time, _Size} ->
 					TX
 			end;
 		TX ->
 			TX
+	end.
+
+%% @doc A tombstone fetched outside ar_join's trail-verification window
+%% is only safe to honour if this node has already learned of the
+%% authorising Admin-Delete from its own chain replay. ?DELETED_TXS_TABLE
+%% (channelchain_deleted_txs) is the index-level deletion set populated
+%% by ar_channelchain_index:maybe_index_tx for confirmed Admin-Delete
+%% txs; if that's empty fall back to the blacklist's programmatic set,
+%% which the same hook writes through ar_tx_blacklist:blacklist_txs/1.
+is_locally_authorised_deletion(TXID) ->
+	InIndex = try ar_channelchain_index:is_deleted(TXID)
+		catch _:_ -> false end,
+	InProgrammatic = try
+		ets:info(ar_tx_blacklist_programmatic) =/= undefined
+				andalso ets:member(ar_tx_blacklist_programmatic, TXID)
+	catch _:_ -> false end,
+	InIndex orelse InProgrammatic.
+
+%% @doc Decide what to do with a tombstone returned by the legacy
+%% (non-JOIN) fetch path. Three outcomes:
+%%   accept — local index has the authorising Admin-Delete on record.
+%%   defer  — local index is still empty (this node hasn't replayed
+%%            anything yet, e.g. ar_header_sync racing
+%%            ar_channelchain_index:build_index in the first seconds
+%%            after JOIN settles). Accept the stub with a warning so
+%%            ar_header_sync can finish; the same tx will be
+%%            re-verified once the chain is replayed and any
+%%            unauthorised stub will be cleaned up by the next
+%%            blacklist refresh.
+%%   reject — local index is populated and the tx isn't in it. Most
+%%            likely a peer-forged tombstone; drop it.
+tombstone_trust_decision(TXID) ->
+	case is_locally_authorised_deletion(TXID) of
+		true ->
+			accept;
+		false ->
+			case has_locally_replayed_chain() of
+				true -> reject;
+				false -> defer
+			end
+	end.
+
+has_locally_replayed_chain() ->
+	try ets:info(channelchain_tx_tags, size) of
+		N when is_integer(N), N > 0 -> true;
+		_ -> false
+	catch
+		_:_ -> false
 	end.
 
 get_tx_from_remote_peers(Peers, TXID) ->
