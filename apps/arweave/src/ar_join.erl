@@ -648,7 +648,16 @@ do_get_blocks([{H, _, _} | Trail], FetchState, TrustedDeletions) ->
 unwrap_tx({pending_tombstone, #tx{} = Stub}, TXID, TrustedDeletions) ->
 	case sets:is_element(TXID, TrustedDeletions) of
 		true ->
-			?LOG_INFO([{event, accepted_trail_verified_tombstone},
+			%% LOG_WARNING (not LOG_INFO). The chain runs ar_logger's
+			%% configured handlers — arweave_info captures most events
+			%% but ar_join warning lines reliably show up via the
+			%% console handler (`docker logs <chain-container>`), so
+			%% runbook §9.2 uses docker logs as the canonical place to
+			%% grep for this signal. LOG_INFO from ar_join is sometimes
+			%% squelched by the file handler's burst_limit during the
+			%% trail-fetch storm; LOG_WARNING survives because it's
+			%% delivered via the console handler too.
+			?LOG_WARNING([{event, accepted_trail_verified_tombstone},
 					{tx, ar_util:encode(TXID)}]),
 			catch ar_storage:write_tombstone(Stub),
 			Stub;
