@@ -2043,7 +2043,8 @@ read_recent_blocks2([], _SearchDepth, Skipped) ->
 read_recent_blocks2([{BH, _, _} | BI], SearchDepth, Skipped) ->
 	case ar_storage:read_block(BH) of
 		B = #block{} ->
-			TXs = ar_storage:read_tx(B#block.txs),
+			TXs0 = ar_storage:read_tx(B#block.txs),
+			TXs = fill_tombstones(B#block.txs, TXs0),
 			case lists:any(fun(TX) -> TX == unavailable end, TXs) of
 				true ->
 					read_recent_blocks2(BI, SearchDepth, Skipped + 1);
@@ -2064,6 +2065,25 @@ read_recent_blocks2([{BH, _, _} | BI], SearchDepth, Skipped) ->
 			read_recent_blocks2(BI, SearchDepth, Skipped + 1)
 	end.
 
+%% Fill in tombstone stubs for txs that ar_storage:read_tx returns as
+%% `unavailable` because the body has been physically deleted by Admin-Delete.
+%% start_from_state needs a #tx{} record per TXID to recompute size_tagged_txs;
+%% the tombstone preserves data_root/data_size/tags so block validation passes.
+fill_tombstones(OrigTXs, ReadResult) ->
+	lists:zipwith(
+		fun
+			(_Orig, #tx{} = TX) -> TX;
+			(Orig, unavailable) ->
+				TXID = case Orig of
+					#tx{ id = ID } -> ID;
+					ID when is_binary(ID) -> ID
+				end,
+				case ar_storage:read_tombstone(TXID) of
+					#tx{} = Stub -> Stub;
+					_ -> unavailable
+				end
+		end, OrigTXs, ReadResult).
+
 read_recent_blocks3([], _BlocksToRead, Blocks) ->
 	lists:reverse(Blocks);
 read_recent_blocks3(_BI, 0, Blocks) ->
@@ -2071,7 +2091,8 @@ read_recent_blocks3(_BI, 0, Blocks) ->
 read_recent_blocks3([{BH, _, _} | BI], BlocksToRead, Blocks) ->
 	case ar_storage:read_block(BH) of
 		B = #block{} ->
-			TXs = ar_storage:read_tx(B#block.txs),
+			TXs0 = ar_storage:read_tx(B#block.txs),
+			TXs = fill_tombstones(B#block.txs, TXs0),
 			case lists:any(fun(TX) -> TX == unavailable end, TXs) of
 				true ->
 					ar:console("Failed to find all transaction headers for the block ~s.~n",
