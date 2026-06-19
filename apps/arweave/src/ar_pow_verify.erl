@@ -1,6 +1,7 @@
 -module(ar_pow_verify).
 
--export([validate_tx_pow/1, check_leading_zeros/2, get_current_difficulty/0, get_difficulty_for_board/1]).
+-export([validate_tx_pow/1, validate_tx_pow_join/1, check_leading_zeros/2,
+		get_current_difficulty/0, get_difficulty_for_board/1]).
 
 -include_lib("arweave/include/ar.hrl").
 
@@ -46,6 +47,44 @@ validate_tx_pow(TX) ->
 				_ -> get_difficulty_for_board(BoardId)
 			end,
 			check_leading_zeros(Hash, Difficulty)
+	end.
+
+%% @doc Deterministic PoW check for the JOIN path.
+%%
+%% validate_tx_pow/1 consults get_current_difficulty/0 which reads
+%% ets:info(channelchain_tx_tags, size). That table is populated
+%% incrementally as a node replays the chain, so the threshold a
+%% peer-served historical TX is judged against keeps shifting under the
+%% joiner's feet — same TX, same peer, different ETS state, different
+%% verdict. Verified in prod 2026-06-19: a TX with L=18 was rejected
+%% because ETS size 1429 → difficulty 24 (board-scaled 19).
+%%
+%% This variant uses a fixed floor (LOW_LOAD_DIFFICULTY = 16) and does
+%% NOT consult any ETS table. Rationale:
+%%
+%%   - Historical TXs must validate identically on every joiner. Floor
+%%     must be a constant of the protocol, not local node state.
+%%   - 16 is the lowest difficulty the dynamic ladder ever picks, so any
+%%     TX produced on a healthy chain at low load already cleared 16.
+%%   - Board scaling is intentionally skipped: board_configs is itself
+%%     replayed from chain state, so during JOIN it may be empty (giving
+%%     a different floor than after JOIN completes — the exact
+%%     non-determinism we're eliminating). Boards with pow_difficulty
+%%     < 100 may have legitimate TXs at L < 16; those will be rejected
+%%     by this floor. The trade-off is accepted to keep JOIN
+%%     deterministic across nodes. Live ingestion (POST /tx) keeps
+%%     validate_tx_pow/1 with board scaling and dynamic load.
+%%   - Trail integrity (block hashing, owner+signature for admin TXs,
+%%     C1 id match) is unchanged.
+validate_tx_pow_join(TX) ->
+	case lists:keyfind(<<"PoW-Nonce">>, 1, TX#tx.tags) of
+		false ->
+			false;
+		{<<"PoW-Nonce">>, NonceBin} ->
+			DataBin = TX#tx.data,
+			Input = <<DataBin/binary, NonceBin/binary>>,
+			Hash = crypto:hash(sha256, Input),
+			check_leading_zeros(Hash, ?LOW_LOAD_DIFFICULTY)
 	end.
 
 %% @doc Returns the current effective PoW difficulty based on recent TX rate.

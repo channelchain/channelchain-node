@@ -121,11 +121,16 @@ verify(TX, Args, VerifySignature) ->
 %% behaviour in ar_tx:do_verify_v2 by validating PoW-Nonce instead, so a
 %% peer-served anonymous tx whose id and hash agree is accepted during JOIN.
 verify_tx_id(ExpectedID, #tx{ format = 1, signature = <<>>, id = ID } = TX) ->
-	ExpectedID == ID andalso ar_pow_verify:validate_tx_pow(TX) andalso verify_hash(TX);
+	%% Anonymous (PoW-gated) JOIN path: use the deterministic floor.
+	%% validate_tx_pow/1 reads channelchain_tx_tags ETS size, which makes
+	%% peer-served historical TXs validate differently on different
+	%% joiners. See ar_pow_verify:validate_tx_pow_join/1.
+	ExpectedID == ID andalso ar_pow_verify:validate_tx_pow_join(TX) andalso verify_hash(TX);
 verify_tx_id(ExpectedID, #tx{ format = 1, id = ID } = TX) ->
 	ExpectedID == ID andalso verify_signature_v1(TX, verify_signature) andalso verify_hash(TX);
 verify_tx_id(ExpectedID, #tx{ format = 2, signature = <<>>, id = ID } = TX) ->
-	ExpectedID == ID andalso ar_pow_verify:validate_tx_pow(TX) andalso verify_hash(TX);
+	%% Same rationale as the format=1 anonymous clause above.
+	ExpectedID == ID andalso ar_pow_verify:validate_tx_pow_join(TX) andalso verify_hash(TX);
 verify_tx_id(ExpectedID, #tx{ format = 2, id = ID } = TX) ->
 	ExpectedID == ID andalso verify_signature_v2(TX, verify_signature) andalso verify_hash(TX).
 
