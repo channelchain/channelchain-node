@@ -281,7 +281,16 @@ handle_info({event, disksup, {remaining_disk_space, ?DEFAULT_MODULE, true, _Perc
 	{ok, Config} = arweave_config:get_env(),
 	DiskPoolSize = Config#config.max_disk_pool_buffer_mb * ?MiB,
 	DiskCacheSize = Config#config.disk_cache_size * 1048576,
-	BufferSize = 10_000_000_000,
+	%% Was 10_000_000_000 (10 GB), sized for production miner hosts with 100GB+
+	%% disks. ChannelChain runs on Hetzner CX22 (38GB) and Oracle ARM (45GB):
+	%% even with empty disks the 10GB buffer + 100GB default pool_buffer +
+	%% 5GB default disk_cache exceeded total capacity, so disksup periodic
+	%% checks always flipped is_disk_space_sufficient to false. That silently
+	%% killed write_full_block — chain kept producing blocks but their
+	%% bodies stopped reaching block_db/tx_db, and the next restart crashed
+	%% with block_headers_not_found (incident 2026-06-20).
+	%% 1GB buffer is plenty for header-only sync on these nodes.
+	BufferSize = 1_000_000_000,
 	case Bytes < DiskPoolSize + DiskCacheSize + BufferSize div 2 of
 		true ->
 			case State#state.is_disk_space_sufficient of
