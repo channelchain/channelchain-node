@@ -572,10 +572,17 @@ with_db(Name, Op, Callback) ->
 				apply(Callback, [DbRec0])
 		end
 	catch
-		Exc ->
+		%% Bug 1 fix (2026-07): the previous `catch Exc ->` form only caught
+		%% throw class exceptions. rocksdb NIF errors are raised as
+		%% error:badarg and propagated up to callers, crashing HTTP request
+		%% processes (cc-miner3 crash-loop root cause). Extending to
+		%% Class:Exc:Stack normalizes all exception classes into {error, failed}.
+		Class:Exc:Stack ->
 			?LOG_ERROR([{event, db_operation_failed}, {op, Op},
 				{name, io_lib:format("~p", [Name])},
-				{reason, io_lib:format("~p", [Exc])}]),
+				{class, Class},
+				{reason, io_lib:format("~p", [Exc])},
+				{stack, io_lib:format("~p", [Stack])}]),
 			{error, failed}
 	end.
 

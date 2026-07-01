@@ -190,7 +190,7 @@ is_recorded(Offset, ID) ->
 %% the given Offset is found in the record with the given ID
 %% in the storage module identified by StoreID, false otherwise.
 is_recorded(Offset, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, StoreID}) of
+	case safe_sync_records_lookup({ID, StoreID}) of
 		[] ->
 			false;
 		[{_, TID}] ->
@@ -211,7 +211,7 @@ is_recorded(Offset, ID, StoreID) ->
 %% is found in the record in the storage module identified by StoreID,
 %% false otherwise.
 is_recorded(Offset, Packing, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, Packing, StoreID}) of
+	case safe_sync_records_lookup({ID, Packing, StoreID}) of
 		[] ->
 			false;
 		[{_, TID}] ->
@@ -222,7 +222,7 @@ is_recorded(Offset, Packing, ID, StoreID) ->
 %% and at most EndOffsetUpperBound.
 %% Return not_found if there are no such intervals.
 get_next_synced_interval(Offset, EndOffsetUpperBound, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, StoreID}) of
+	case safe_sync_records_lookup({ID, StoreID}) of
 		[] ->
 			not_found;
 		[{_, TID}] ->
@@ -237,7 +237,7 @@ get_next_unsynced_interval(Offset, EndOffsetUpperBound, _ID, _StoreID)
 		when Offset >= EndOffsetUpperBound ->
 	not_found;
 get_next_unsynced_interval(Offset, EndOffsetUpperBound, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, StoreID}) of
+	case safe_sync_records_lookup({ID, StoreID}) of
 		[] ->
 			{EndOffsetUpperBound, Offset};
 		[{_, TID}] ->
@@ -248,7 +248,7 @@ get_next_unsynced_interval(Offset, EndOffsetUpperBound, ID, StoreID) ->
 %% and at most EndOffsetUpperBound.
 %% Return not_found if there are no such intervals.
 get_next_synced_interval(Offset, EndOffsetUpperBound, Packing, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, Packing, StoreID}) of
+	case safe_sync_records_lookup({ID, Packing, StoreID}) of
 		[] ->
 			not_found;
 		[{_, TID}] ->
@@ -263,7 +263,7 @@ get_next_unsynced_interval(Offset, EndOffsetUpperBound, _Packing, _ID, _StoreID)
 		when Offset >= EndOffsetUpperBound ->
 	not_found;
 get_next_unsynced_interval(Offset, EndOffsetUpperBound, Packing, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, Packing, StoreID}) of
+	case safe_sync_records_lookup({ID, Packing, StoreID}) of
 		[] ->
 			{EndOffsetUpperBound, Offset};
 		[{_, TID}] ->
@@ -274,7 +274,7 @@ get_next_unsynced_interval(Offset, EndOffsetUpperBound, Packing, ID, StoreID) ->
 %% excluding the left bound. Return not_found if the given offset does not belong to
 %% any interval.
 get_interval(Offset, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, StoreID}) of
+	case safe_sync_records_lookup({ID, StoreID}) of
 		[] ->
 			not_found;
 		[{_, TID}] ->
@@ -284,7 +284,7 @@ get_interval(Offset, ID, StoreID) ->
 %% @doc Return the size of the intersection between the intervals and the given range.
 %% Return 0 if the given ID and StoreID are not found.
 get_intersection_size(End, Start, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, StoreID}) of
+	case safe_sync_records_lookup({ID, StoreID}) of
 		[] ->
 			0;
 		[{_, TID}] ->
@@ -458,6 +458,16 @@ terminate(Reason, State) ->
 %%% Private functions.
 %%%===================================================================
 
+%% Bug 2 fix (2026-07): the sync_records ETS table is created by
+%% ar_sync_record_sup during startup. If a public function is called
+%% before that (e.g. an HTTP request racing with boot, or after a
+%% supervisor collapse), ets:lookup raises error:badarg. That crash
+%% was cc-miner3's dominant crash-loop trigger. Treat missing table
+%% as empty result; downstream case clauses already handle [] safely.
+safe_sync_records_lookup(Key) ->
+	try ets:lookup(sync_records, Key)
+	catch error:badarg -> [] end.
+
 name(StoreID) when is_atom(StoreID) ->
 	list_to_atom("ar_sync_record_" ++ atom_to_list(StoreID));
 name(StoreID) ->
@@ -570,7 +580,7 @@ is_recorded_any(_Offset, _ID, []) ->
 is_recorded2(_Offset, '$end_of_table', _ID, _StoreID) ->
 	false;
 is_recorded2(Offset, {ID, Packing, StoreID}, ID, StoreID) ->
-	case ets:lookup(sync_records, {ID, Packing, StoreID}) of
+	case safe_sync_records_lookup({ID, Packing, StoreID}) of
 		[{_, TID}] ->
 			case ar_ets_intervals:is_inside(TID, Offset) of
 				true ->
@@ -767,7 +777,7 @@ store_state(State) ->
 	end.
 
 get_or_create_type_tid(IDType) ->
-	case ets:lookup(sync_records, IDType) of
+	case safe_sync_records_lookup(IDType) of
 		[] ->
 			TID = ets:new(sync_record_type, [ordered_set, public, {read_concurrency, true}]),
 			ets:insert(sync_records, {IDType, TID}),

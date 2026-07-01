@@ -4017,6 +4017,13 @@ get_data_roots_for_offset_inner(Offset, BlockStart, BlockEnd, TXRoot) ->
 			case ar_kv:get(DB, << BlockStart:?OFFSET_KEY_BITSIZE >>) of
 				not_found ->
 					{error, not_found};
+				%% Bug 3 fix (2026-07): ar_kv:get can now return {error, failed}
+				%% or {error, db_not_found} when the underlying rocksdb NIF fails
+				%% or the DB was never registered (both observed on cc-miner3).
+				%% Without this clause the case_clause exception crashes the
+				%% HTTP request process instead of returning a clean 404.
+				{error, _} ->
+					{error, not_found};
 				{ok, Bin} ->
 					{TXRoot2, BlockSize, DataRootIndexKeySet} = binary_to_term(Bin),
 					true = TXRoot2 == TXRoot,
@@ -4059,6 +4066,12 @@ read_data_root_entries(DataRoot, TXSize, BlockStart, Cursor, StoreID, Acc) ->
 		{ok, _, _} ->
 			Acc;
 		none ->
+			Acc;
+		%% Bug 3 fix (2026-07): ar_kv:get_prev can return {error, failed} or
+		%% {error, db_not_found} when the underlying rocksdb NIF fails
+		%% (observed on cc-miner3). Treat as no more entries so the fold
+		%% completes with whatever it has instead of crashing the caller.
+		{error, _} ->
 			Acc
 	end.
 
