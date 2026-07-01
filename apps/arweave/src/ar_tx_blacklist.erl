@@ -384,11 +384,45 @@ initialize_state() ->
 	lists:foreach(
 		fun
 			(Name) ->
-				{ok, _} = dets:open_file(Name, [{file, filename:join(Dir, Name)}]),
+				open_dets_recover_empty(Name, filename:join(Dir, Name)),
 				true = ets:from_dets(Name, Name)
 		end,
 		Names
 	).
+
+%% Bug 5 fix (2026-07): a 0-byte dets file on disk (observed on cc-miner:
+%% ar_tx_blacklist truncated to 0 bytes on 2026-06-22, likely a mid-flush
+%% termination) makes dets:open_file crash the ar_tx_blacklist gen_server
+%% with {not_a_dets_file, File}. That kills the arweave application at
+%% boot and the container hits an unrecoverable restart loop until the
+%% file is manually deleted. When the file is empty there is nothing to
+%% preserve, so log a warning, remove the stub and let dets create a
+%% fresh table. Any non-empty open failure still crashes to preserve
+%% data integrity.
+open_dets_recover_empty(Name, File) ->
+	case dets:open_file(Name, [{file, File}]) of
+		{ok, _} ->
+			ok;
+		{error, {not_a_dets_file, _}} ->
+			case filelib:file_size(File) of
+				0 ->
+					?LOG_WARNING([{event, empty_dets_file_recreated},
+							{module, ?MODULE}, {name, Name}, {file, File}]),
+					ok = file:delete(File),
+					{ok, _} = dets:open_file(Name, [{file, File}]),
+					ok;
+				Size ->
+					?LOG_ERROR([{event, not_a_dets_file_nonempty},
+							{module, ?MODULE}, {name, Name},
+							{file, File}, {size, Size}]),
+					error({not_a_dets_file, File})
+			end;
+		{error, Reason} ->
+			?LOG_ERROR([{event, dets_open_failed},
+					{module, ?MODULE}, {name, Name},
+					{file, File}, {reason, Reason}]),
+			error({dets_open_failed, Name, Reason})
+	end.
 
 refresh_blacklist() ->
 	{ok, Config} = arweave_config:get_env(),
