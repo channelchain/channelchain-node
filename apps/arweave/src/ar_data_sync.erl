@@ -313,10 +313,19 @@ put_chunk_metadata(AbsoluteEndOffset, StoreID,
 	ar_kv:put({chunks_index, StoreID}, Key, term_to_binary(Metadata)).
 
 get_chunk_metadata(AbsoluteEndOffset, StoreID) ->
+	%% Fable C3 (2026-07-03): ar_kv:get now returns {error, failed} /
+	%% {error, db_not_found} on NIF failure or unregistered DB (Bug 1
+	%% contract change in a429f1d2). Without an {error, _} arm here
+	%% the case_clause tears down the calling gen_server (~30 similar
+	%% sites in this module; this is one of the highest-traffic ones).
+	%% Treat DB failure as "chunk not available" — the request handler
+	%% will 404, and Bug 1's LOG_ERROR already carries the class/stack.
 	case ar_kv:get({chunks_index, StoreID}, << AbsoluteEndOffset:?OFFSET_KEY_BITSIZE >>) of
 		{ok, Value} ->
 			{ok, binary_to_term(Value)};
 		not_found ->
+			not_found;
+		{error, _} ->
 			not_found
 	end.
 
@@ -4052,6 +4061,9 @@ get_data_roots_for_offset_inner(Offset, BlockStart, BlockEnd, TXRoot) ->
 %% Assert the given BlockEnd and TXRoot match the stored values.
 are_data_roots_synced(BlockStart, BlockEnd, TXRoot) ->
 	DB = {data_root_offset_index, ?DEFAULT_MODULE},
+	%% Fable C3 (2026-07-03): treat DB failure as "not synced". The
+	%% only two current callers are diagnostic/decision paths, and
+	%% "we can't tell → assume no" is the safer default than crashing.
 	case ar_kv:get(DB, << BlockStart:?OFFSET_KEY_BITSIZE >>) of
 		not_found ->
 			false;
@@ -4059,7 +4071,9 @@ are_data_roots_synced(BlockStart, BlockEnd, TXRoot) ->
 			{TXRoot2, BlockSize, _DataRootIndexKeySet} = binary_to_term(Bin),
 			true = TXRoot2 == TXRoot,
 			true = BlockSize == BlockEnd - BlockStart,
-			true
+			true;
+		{error, _} ->
+			false
 	end.
 
 read_data_root_entries(_DataRoot, _TXSize, _BlockStart, 0, _StoreID, Acc) ->
