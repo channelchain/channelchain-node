@@ -88,6 +88,31 @@ found_solution(Source, Solution, PoACache, PoA2Cache) ->
 %%%===================================================================
 
 init([]) ->
+	try init_body()
+	catch
+		Class:Reason:Stack ->
+			%% Fable §4.1 (Bug 4, 2026-07-03): make ar_node_worker boot
+			%% failures loud. cc-miner3 sat in a 68-hour crash loop
+			%% because init/1 crashed silently — the LOG_ERROR reports
+			%% that the logger backend emits happen on stderr, which
+			%% docker's json driver captures, but only after logger's
+			%% own handlers are configured, and the crash was hitting
+			%% before that. `ar:console` writes straight to stdout via
+			%% `io:format`, which docker captures immediately, so this
+			%% ensures the diagnostic is in `docker logs` no matter
+			%% how early the failure lands. Then re-raise so
+			%% start_error propagates as before.
+			ar:console(
+				"~n=== FATAL: ar_node_worker init failed ===~n"
+				"  class:  ~p~n"
+				"  reason: ~p~n"
+				"  stack:  ~p~n"
+				"=== see runbook §11.6.1 (Bug 4 detection) ===~n~n",
+				[Class, Reason, Stack]),
+			erlang:raise(Class, Reason, Stack)
+	end.
+
+init_body() ->
 	?LOG_INFO([{start, ?MODULE}, {pid,self()}]),
 	%% Trap exit to avoid corrupting any open files on quit.
 	process_flag(trap_exit, true),
