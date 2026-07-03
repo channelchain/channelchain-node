@@ -6,7 +6,8 @@
 		is_recorded/2, is_recorded/3, is_recorded/4, is_recorded_any/3,
 		get_next_synced_interval/4, get_next_synced_interval/5,
 		get_next_unsynced_interval/4, get_next_unsynced_interval/5,
-		get_interval/3, get_intersection_size/4, name/1]).
+		get_interval/3, get_intersection_size/4, name/1,
+		safe_sync_records_lookup/1, safe_sync_records_first/0, safe_sync_records_next/1]).
 
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 
@@ -198,7 +199,7 @@ is_recorded(Offset, ID, StoreID) ->
 				false ->
 					false;
 				true ->
-					case is_recorded2(Offset, ets:first(sync_records), ID, StoreID) of
+					case is_recorded2(Offset, safe_sync_records_first(), ID, StoreID) of
 						false ->
 							true;
 						{true, Packing} ->
@@ -461,12 +462,43 @@ terminate(Reason, State) ->
 %% Bug 2 fix (2026-07): the sync_records ETS table is created by
 %% ar_sync_record_sup during startup. If a public function is called
 %% before that (e.g. an HTTP request racing with boot, or after a
-%% supervisor collapse), ets:lookup raises error:badarg. That crash
-%% was cc-miner3's dominant crash-loop trigger. Treat missing table
-%% as empty result; downstream case clauses already handle [] safely.
+%% supervisor collapse), ets:lookup / ets:first / ets:next raise
+%% error:badarg. That crash was cc-miner3's dominant crash-loop
+%% trigger. Treat missing table as empty result; downstream case
+%% clauses already handle [] and '$end_of_table' safely.
+%%
+%% Fable review R3 (2026-07-03): each helper logs a warning event
+%% when the fallback path fires. Without the log the node would enter
+%% a silent-degradation mode (every sync-record query returns "not
+%% synced") that is externally indistinguishable from a healthy but
+%% under-populated node. The warning gives operators a grep target;
+%% at HTTP-request rate the log volume is bounded by the client and
+%% self-limiting in practice.
 safe_sync_records_lookup(Key) ->
 	try ets:lookup(sync_records, Key)
-	catch error:badarg -> [] end.
+	catch error:badarg ->
+		?LOG_WARNING([{event, sync_records_table_missing},
+				{module, ?MODULE}, {op, lookup},
+				{key, io_lib:format("~p", [Key])}]),
+		[]
+	end.
+
+safe_sync_records_first() ->
+	try ets:first(sync_records)
+	catch error:badarg ->
+		?LOG_WARNING([{event, sync_records_table_missing},
+				{module, ?MODULE}, {op, first}]),
+		'$end_of_table'
+	end.
+
+safe_sync_records_next(Key) ->
+	try ets:next(sync_records, Key)
+	catch error:badarg ->
+		?LOG_WARNING([{event, sync_records_table_missing},
+				{module, ?MODULE}, {op, next},
+				{key, io_lib:format("~p", [Key])}]),
+		'$end_of_table'
+	end.
 
 name(StoreID) when is_atom(StoreID) ->
 	list_to_atom("ar_sync_record_" ++ atom_to_list(StoreID));
@@ -586,7 +618,7 @@ is_recorded2(Offset, {ID, Packing, StoreID}, ID, StoreID) ->
 				true ->
 					{true, Packing};
 				false ->
-					is_recorded2(Offset, ets:next(sync_records, {ID, Packing, StoreID}), ID,
+					is_recorded2(Offset, safe_sync_records_next({ID, Packing, StoreID}), ID,
 							StoreID)
 			end;
 		[] ->
@@ -594,7 +626,7 @@ is_recorded2(Offset, {ID, Packing, StoreID}, ID, StoreID) ->
 			false
 	end;
 is_recorded2(Offset, Key, ID, StoreID) ->
-	is_recorded2(Offset, ets:next(sync_records, Key), ID, StoreID).
+	is_recorded2(Offset, safe_sync_records_next(Key), ID, StoreID).
 
 read_sync_records(StateDB, StoreID) ->
 	{SyncRecordByID, SyncRecordByIDType} =
@@ -776,8 +808,15 @@ store_state(State) ->
 			{ok, State#state{ wal = 0 }}
 	end.
 
+%% Fable review R2 (2026-07-03): writer path. sync_records MUST exist
+%% here because ar_sync_record_sup creates it in its own init/1 before
+%% starting any ar_sync_record worker. If it does not exist, the
+%% badarg on ets:lookup / ets:insert is a supervision-tree bug that
+%% should surface as a loud crash, not be silently masked by the
+%% read-path helper. Using the raw ets: calls makes the intent
+%% explicit and puts the crash on the right line.
 get_or_create_type_tid(IDType) ->
-	case safe_sync_records_lookup(IDType) of
+	case ets:lookup(sync_records, IDType) of
 		[] ->
 			TID = ets:new(sync_record_type, [ordered_set, public, {read_concurrency, true}]),
 			ets:insert(sync_records, {IDType, TID}),

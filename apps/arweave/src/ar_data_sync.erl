@@ -479,7 +479,12 @@ get_chunk(Offset, #{ packing := Packing } = Options) ->
 			UnpackedReply = ar_sync_record:is_recorded(Offset, {ar_data_sync, unpacked}),
 			Modules = ar_storage_module:get_all(Offset),
 			ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
-			RootRecords = [ets:lookup(sync_records, {ar_data_sync, ID})
+			%% Fable review C2 (2026-07-03): raw ets:lookup(sync_records,...) here
+			%% is HTTP-reachable diagnostic-log code; a boot-race with the sync
+			%% record supervisor turns it into error:badarg on ETS lookup and
+			%% kills the request handler. Route through the safe helper so
+			%% the log line simply reports "table_missing" instead.
+			RootRecords = [ar_sync_record:safe_sync_records_lookup({ar_data_sync, ID})
 					|| ID <- ModuleIDs],
 			case RequestOrigin of
 				miner ->
@@ -2071,7 +2076,10 @@ read_chunk_with_metadata(
 						false ->
 							Modules = ar_storage_module:get_all(SeekOffset),
 							ModuleIDs = [ar_storage_module:id(Module) || Module <- Modules],
-							RootRecords = [ets:lookup(sync_records, {ar_data_sync, ID})
+							%% Fable review C2 (2026-07-03): same safe-lookup swap as
+							%% above; this is the sibling diagnostic path in
+							%% chunk_metadata_read_sync_record_race_condition.
+							RootRecords = [ar_sync_record:safe_sync_records_lookup({ar_data_sync, ID})
 									|| ID <- ModuleIDs],
 							log_chunk_error(RequestOrigin, chunk_metadata_read_sync_record_race_condition,
 								[{seek_offset, SeekOffset},
