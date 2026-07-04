@@ -15,6 +15,10 @@
 -include_lib("eunit/include/eunit.hrl").
 
 -define(WITH_DB(Name, Callback), with_db(Name, ?FUNCTION_NAME, Callback)).
+
+%% Fable R13 (2026-07-04): exported for regression testing of Bug 1
+%% (catch class widening). See test/ar_kv_error_class_tests.erl.
+-export([with_db/3]).
 -define(WITH_ITERATOR(Name, IteratorOptions, Callback), with_iterator(Name, ?FUNCTION_NAME, IteratorOptions, Callback)).
 
 -define(DEFAULT_ROCKSDB_DATABASE_OPTIONS, #{
