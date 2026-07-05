@@ -80,7 +80,13 @@ read_reward_history([{H, _WeaveSize, _TXRoot} | BI]) ->
 					not_found;
 				{ok, Bin} ->
 					Element = binary_to_term(Bin),
-					[Element | History]
+					[Element | History];
+				%% Fable C3 (2026-07-05): ar_kv:get can now surface
+				%% {error, failed} / {error, db_not_found}. Treat as
+				%% not_found so the recursion terminates safely rather
+				%% than case_clause the calling gen_server.
+				{error, _} ->
+					not_found
 			end
 	end.
 
@@ -101,7 +107,10 @@ read_block_time_history(Height, [{H, _WeaveSize, _TXRoot} | BI]) ->
 							not_found;
 						{ok, Bin} ->
 							Element = binary_to_term(Bin),
-							[Element | History]
+							[Element | History];
+						%% Fable C3 (2026-07-05): same as read_reward_history.
+						{error, _} ->
+							not_found
 					end
 			end
 	end.
@@ -315,6 +324,11 @@ get_tx_confirmation_data(TXID) ->
 		{ok, Binary} ->
 			{ok, binary_to_term(Binary)};
 		not_found ->
+			not_found;
+		%% Fable C3 (2026-07-05): HTTP-reachable via /tx/:id/status.
+		%% Treat DB failure as not_found so the request 404s cleanly
+		%% instead of crashing the handler.
+		{error, _} ->
 			not_found
 	end.
 
