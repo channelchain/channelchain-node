@@ -401,28 +401,42 @@ initialize_state() ->
 %% termination) makes dets:open_file crash the ar_tx_blacklist gen_server
 %% with {not_a_dets_file, File}. That kills the arweave application at
 %% boot and the container hits an unrecoverable restart loop until the
-%% file is manually deleted. When the file is empty there is nothing to
-%% preserve, so log a warning, remove the stub and let dets create a
-%% fresh table. Any non-empty open failure still crashes to preserve
-%% data integrity.
+%% file is manually deleted.
+%%
+%% Fable R6 (2026-07-05): the follow-up review flagged that our
+%% initial fix only auto-recovered 0-byte files and still crashed on
+%% non-empty garbage. But everything ar_tx_blacklist persists in dets
+%% is re-derivable: the primary blacklist is refreshed from
+%% transaction_blacklist_files / _urls on the next tick, offsets and
+%% pending_* rebuild from mempool + block observations. So a corrupt
+%% file is not obviously worth losing uptime over. Quarantine instead
+%% of crash: rename the corrupt file to <file>.corrupt.<epoch_ms> and
+%% let dets create a fresh table. LOG_ERROR calls attention to the
+%% incident so an operator can inspect the quarantined file offline
+%% without the node being down while they do it.
 open_dets_recover_empty(Name, File) ->
 	case dets:open_file(Name, [{file, File}]) of
 		{ok, _} ->
 			ok;
 		{error, {not_a_dets_file, _}} ->
-			case filelib:file_size(File) of
+			Size = filelib:file_size(File),
+			case Size of
 				0 ->
 					?LOG_WARNING([{event, empty_dets_file_recreated},
 							{module, ?MODULE}, {name, Name}, {file, File}]),
-					ok = file:delete(File),
-					{ok, _} = dets:open_file(Name, [{file, File}]),
-					ok;
-				Size ->
-					?LOG_ERROR([{event, not_a_dets_file_nonempty},
+					ok = file:delete(File);
+				_ ->
+					Quarantine = File ++ ".corrupt." ++
+							integer_to_list(erlang:system_time(millisecond)),
+					?LOG_ERROR([{event, dets_file_quarantined},
 							{module, ?MODULE}, {name, Name},
-							{file, File}, {size, Size}]),
-					error({not_a_dets_file, File})
-			end;
+							{file, File}, {size, Size},
+							{quarantine, Quarantine},
+							{note, "runbook §11.6 の note を参照"}]),
+					ok = file:rename(File, Quarantine)
+			end,
+			{ok, _} = dets:open_file(Name, [{file, File}]),
+			ok;
 		{error, Reason} ->
 			?LOG_ERROR([{event, dets_open_failed},
 					{module, ?MODULE}, {name, Name},

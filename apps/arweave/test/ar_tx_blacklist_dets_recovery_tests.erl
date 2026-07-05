@@ -18,11 +18,15 @@
 %%% the corruption is not obviously safe to discard is more important
 %%% than uptime.
 %%%
-%%% These tests pin the three branches of open_dets_recover_empty/2:
+%%% These tests pin the four branches of open_dets_recover_empty/2:
 %%%   (a) file missing               → ok, fresh dets file created
 %%%   (b) file exists, valid dets    → ok, pre-existing entries preserved
 %%%   (c) file exists, 0 bytes       → ok, warning logged, fresh table
-%%%   (d) file exists, non-empty garbage → error({not_a_dets_file, _})
+%%%   (d) file exists, non-empty garbage → ok, garbage quarantined to
+%%%       <file>.corrupt.<epoch_ms>, fresh table (Fable R6 policy change
+%%%       2026-07-05: previously this branch crashed by design; the
+%%%       review argued the contents are re-derivable and uptime is
+%%%       worth more than a crash-loop while an operator investigates)
 %%%
 %%% Fable review R13 asked for exactly this: a decisive re-executable
 %%% test that would have caught the incident, or would fail loudly if
@@ -113,19 +117,33 @@ zero_byte_recovered_as_fresh_test() ->
 		cleanup(Dir)
 	end.
 
-%% (d) Non-empty garbage file → still crashes. This is intentional
-%% policy: we do not want to silently discard data whose corruption
-%% could hide something we should investigate.
-non_empty_garbage_still_crashes_test() ->
+%% (d) Non-empty garbage file → quarantined + fresh dets. Fable R6
+%% policy: rename corrupt to <file>.corrupt.<epoch_ms>, LOG_ERROR the
+%% event so operators can inspect the quarantined bytes offline, then
+%% create a fresh table so the node keeps running. Everything the
+%% dets files hold is re-derivable from config + chain state.
+non_empty_garbage_quarantined_test() ->
 	Dir = tmp_dir(),
 	try
 		Name = random_name(),
 		File = filename:join(Dir, atom_to_list(Name)),
-		%% Write ~4KB of random garbage.
-		ok = file:write_file(File, crypto:strong_rand_bytes(4096)),
+		%% Write ~4KB of random garbage. Capture the bytes so we can
+		%% verify the quarantine preserved them.
+		Garbage = crypto:strong_rand_bytes(4096),
+		ok = file:write_file(File, Garbage),
 		?assert(filelib:file_size(File) > 0),
-		?assertError({not_a_dets_file, _},
-			ar_tx_blacklist:open_dets_recover_empty(Name, File))
+		%% Pre-R6 (before 2026-07-05) this raised {not_a_dets_file, _}.
+		ok = ar_tx_blacklist:open_dets_recover_empty(Name, File),
+		%% The original path should now hold a fresh, empty dets.
+		?assertEqual([], dets:match_object(Name, '_')),
+		dets:close(Name),
+		%% The garbage must be renamed to a sibling .corrupt.<ts> file.
+		Files = filelib:wildcard(binary_to_list(Dir) ++ "/*"),
+		Quarantined = [F || F <- Files, string:find(F, ".corrupt.") /= nomatch],
+		?assertMatch([_], Quarantined),
+		[QFile] = Quarantined,
+		{ok, Preserved} = file:read_file(QFile),
+		?assertEqual(Garbage, Preserved)
 	after
 		cleanup(Dir)
 	end.

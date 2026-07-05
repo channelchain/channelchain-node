@@ -500,10 +500,19 @@ close(#db{db_handle = Db, name = Name}) ->
 				])
 		end
 	catch
-		Exc ->
+		%% Fable R1 (2026-07-05): mirror the Bug 1 fix on with_db/3 —
+		%% `catch Exc ->` only caught throw. rocksdb:close/1 can hit
+		%% error:badarg (stale db handle) or exit signals during the
+		%% shutdown-time with_each_db sweep; those escape the try and
+		%% take down whoever is calling close, defeating the graceful
+		%% teardown that safe-stop.sh relies on. Class:Exc:Stack covers
+		%% every class the same way Bug 1 did for with_db.
+		Class:Exc:Stack ->
 			?LOG_ERROR([
 				{event, ar_kv_failed}, {op, close}, {name, io_lib:format("~p", [Name])},
-				{reason, io_lib:format("~p", [Exc])}
+				{class, Class},
+				{reason, io_lib:format("~p", [Exc])},
+				{stack, io_lib:format("~p", [Stack])}
 			])
 	end.
 

@@ -4028,9 +4028,36 @@ get_data_roots_for_offset(Offset) ->
 	end.
 
 get_data_roots_for_offset_inner(Offset, BlockStart, BlockEnd, TXRoot) ->
-			true = Offset >= BlockStart andalso Offset < BlockEnd,
 			StoreID = ?DEFAULT_MODULE,
 			DB = {data_root_offset_index, StoreID},
+			%% Fable R4 (2026-07-05): all three of the previous asserts
+			%% (`true = Offset >= BlockStart...`, `binary_to_term`,
+			%% `true = TXRoot2 == TXRoot`) can fire under real conditions:
+			%%   * range assert  → caller-side off-by-one during a reorg
+			%%     window while ar_block_index snapshots refresh
+			%%   * binary_to_term → rocksdb value corruption (the cc-miner3
+			%%     failure mode surfaced this in the data_sync subtree)
+			%%   * TXRoot mismatch → block reorg between the outer
+			%%     block_index lookup and this inner index read
+			%% All three were badmatch crashes that killed the HTTP
+			%% handler process. Wrap the body so any of them logs an
+			%% error and turns into {error, not_found}, matching the
+			%% Bug 3 {error, _} branch semantics.
+			try get_data_roots_for_offset_inner2(Offset, BlockStart, BlockEnd, TXRoot,
+					StoreID, DB)
+			catch
+				Class:Exc:Stack ->
+					?LOG_ERROR([{event, get_data_roots_for_offset_inner_failed},
+							{offset, Offset}, {block_start, BlockStart},
+							{block_end, BlockEnd},
+							{class, Class},
+							{reason, io_lib:format("~p", [Exc])},
+							{stack, io_lib:format("~p", [Stack])}]),
+					{error, not_found}
+			end.
+
+get_data_roots_for_offset_inner2(Offset, BlockStart, BlockEnd, TXRoot, StoreID, DB) ->
+			true = Offset >= BlockStart andalso Offset < BlockEnd,
 			case ar_kv:get(DB, << BlockStart:?OFFSET_KEY_BITSIZE >>) of
 				not_found ->
 					{error, not_found};
@@ -4093,7 +4120,23 @@ read_data_root_entries(DataRoot, TXSize, BlockStart, Cursor, StoreID, Acc) ->
 		%% {error, db_not_found} when the underlying rocksdb NIF fails
 		%% (observed on cc-miner3). Treat as no more entries so the fold
 		%% completes with whatever it has instead of crashing the caller.
-		{error, _} ->
+		%%
+		%% Fable R5 (2026-07-05): this branch is called from inside a
+		%% sets:fold — silently swallowing the error means the caller
+		%% receives {ok, {TXRoot, BlockSize, PartialEntries}} and treats
+		%% it as authoritative, but a peer receiving PartialEntries as a
+		%% proof-set will fail to reconstruct data. Log the event with
+		%% enough context to correlate against the ar_kv db_operation_failed
+		%% record. Propagating the failure up out of the fold would need
+		%% a caller-side refactor to accept {error, _}; deferred.
+		{error, Reason} ->
+			?LOG_WARNING([{event, read_data_root_entries_partial},
+					{data_root, ar_util:encode(DataRoot)},
+					{tx_size, TXSize},
+					{block_start, BlockStart},
+					{cursor, Cursor},
+					{store_id, StoreID},
+					{reason, io_lib:format("~p", [Reason])}]),
 			Acc
 	end.
 
