@@ -39,16 +39,19 @@
 %% --- helpers ---
 
 tmp_dir() ->
-	Base = filename:join([<<"/tmp">>,
-		list_to_binary(io_lib:format("ar_tx_blacklist_dets_test_~p_~p",
-			[erlang:phash2(make_ref()), erlang:system_time()]))]),
-	ok = filelib:ensure_dir(<<Base/binary, "/x">>),
+	%% dets:open_file wants string paths (binary passes through most of
+	%% the code but hits badarg deep inside dets_server). Keep everything
+	%% as flat strings and let filename:join concatenate them.
+	Base = filename:join("/tmp",
+		lists:flatten(io_lib:format("ar_tx_blacklist_dets_test_~p_~p",
+			[erlang:phash2(make_ref()), erlang:system_time()]))),
+	ok = filelib:ensure_dir(Base ++ "/x"),
 	Base.
 
 cleanup(Dir) ->
 	%% dets:close/1 is idempotent on an already-closed table; the file
 	%% deletion is the important part.
-	os:cmd("rm -rf " ++ binary_to_list(Dir)).
+	os:cmd("rm -rf " ++ Dir).
 
 random_name() ->
 	list_to_atom("dets_test_" ++
@@ -138,7 +141,7 @@ non_empty_garbage_quarantined_test() ->
 		?assertEqual([], dets:match_object(Name, '_')),
 		dets:close(Name),
 		%% The garbage must be renamed to a sibling .corrupt.<ts> file.
-		Files = filelib:wildcard(binary_to_list(Dir) ++ "/*"),
+		Files = filelib:wildcard(Dir ++ "/*"),
 		Quarantined = [F || F <- Files, string:find(F, ".corrupt.") /= nomatch],
 		?assertMatch([_], Quarantined),
 		[QFile] = Quarantined,

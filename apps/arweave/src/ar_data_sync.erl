@@ -26,6 +26,12 @@
 -export([init/1, handle_cast/2, handle_call/3, handle_info/2, terminate/2]).
 -export([enqueue_intervals/3, remove_expired_disk_pool_data_roots/0]).
 
+%% Fable R13 (2026-07-14): exported for regression testing of Bug 3 /
+%% C3 defensive branches. See test/ar_data_sync_error_branch_tests.erl.
+%% Behaviourally an internal helper; the export is a testability
+%% concession, not a stable public API.
+-export([get_chunk_metadata/2]).
+
 -include("ar.hrl").
 -include("ar_sup.hrl").
 -include("ar_consensus.hrl").
