@@ -40,8 +40,21 @@ read_block_index() ->
 		not_found ->
 			not_found;
 		{Height,{_H, _, _, _PrevH}} ->
-			{ok, Map} = ar_kv:get_range(block_index_db, << 0:256 >>, << Height:256 >>),
-			read_block_index_from_map(Map, 0, Height, <<>>, [])
+			%% Fable C3 follow-up (2026-07-15): unaudited caller. Read-side
+			%% of block_index_db, called during boot / start_from_latest_state.
+			%% A DB failure here is fatal — the node cannot function without
+			%% block_index — so log and return not_found so the caller
+			%% (ar_node_worker:init_body/0's start_from_state branch) hits
+			%% its existing block_index_not_found path with a diagnostic log.
+			case ar_kv:get_range(block_index_db, << 0:256 >>, << Height:256 >>) of
+				{ok, Map} ->
+					read_block_index_from_map(Map, 0, Height, <<>>, []);
+				{error, Reason} ->
+					?LOG_ERROR([{event, read_block_index_failed},
+							{reason, io_lib:format("~p", [Reason])},
+							{height, Height}]),
+					not_found
+			end
 	end.
 
 read_block_index_from_map(_Map, Height, End, _PrevH, BI) when Height > End ->
@@ -125,11 +138,21 @@ store_block_index(BI) ->
 	case ar_kv:get_prev(block_index_db, <<"a">>) of
 		none ->
 			update_block_index(NewHeight, 0, lists:reverse(BI));
+		%% Fable C3 follow-up (2026-07-15): unaudited outer case, added
+		%% explicit {error, _} branch. Write path — DB failure is fatal.
+		{error, PrevReason} ->
+			error({store_block_index_get_prev_failed, PrevReason});
 		{ok, << StoredHeight:256 >>, _V} ->
 			%% RootHeight should a historical height shared by both the stored BI and the
 			%% new BI
 			RootHeight = max(0, min(StoredHeight, NewHeight) - ar_block:get_consensus_window_size()),
-			{ok, V} = ar_kv:get(block_index_db, << RootHeight:256 >>),
+			%% Fable C3 follow-up (2026-07-15): unaudited inner badmatch.
+			%% Same rationale as the outer case above.
+			V = case ar_kv:get(block_index_db, << RootHeight:256 >>) of
+				{ok, Value} -> Value;
+				{error, GetReason} ->
+					error({store_block_index_get_failed, GetReason})
+			end,
 			{H, WeaveSize, TXRoot} = lists:nth(NewHeight - RootHeight + 1, BI),
 			case binary_to_term(V) of
 				{H, WeaveSize, TXRoot, _PrevH} ->

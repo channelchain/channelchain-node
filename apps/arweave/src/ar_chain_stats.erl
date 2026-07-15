@@ -47,11 +47,21 @@ init([]) ->
 	{ok, #{}}.
 
 handle_call({get_forks, StartTime}, _From, State) ->
-	{ok, ForksMap} = ar_kv:get_range(forks_db, <<(StartTime * 1000):64>>),
-	%% Sort forks by their key (the timestamp when they were detected) - sorts in
-	%% chronological / ascending order (i.e. first element of the list is the oldest fork)
-	SortedForks = lists:sort(maps:to_list(ForksMap)),
-	Forks = [binary_to_term(Fork) || {_Timestamp, Fork} <- SortedForks],
+	%% Fable C3 follow-up (2026-07-15): unaudited caller of ar_kv:get_range
+	%% surfaced during L2 pre-flight dry-run. Analytics call — return
+	%% empty list on DB failure rather than crash the gen_server.
+	Forks = case ar_kv:get_range(forks_db, <<(StartTime * 1000):64>>) of
+		{ok, ForksMap} ->
+			%% Sort forks by their key (the timestamp when they were detected) - sorts in
+			%% chronological / ascending order (i.e. first element of the list is the oldest fork)
+			SortedForks = lists:sort(maps:to_list(ForksMap)),
+			[binary_to_term(Fork) || {_Timestamp, Fork} <- SortedForks];
+		{error, Reason} ->
+			?LOG_WARNING([{event, get_forks_failed},
+					{module, ?MODULE},
+					{reason, io_lib:format("~p", [Reason])}]),
+			[]
+	end,
 	{reply, Forks, State};
 handle_call(_Request, _From, State) ->
 	{reply, ok, State}.

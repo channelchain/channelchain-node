@@ -63,7 +63,20 @@ init([]) ->
 	process_flag(trap_exit, true),
 	[ok, ok] = ar_events:subscribe([tx, disksup]),
 	{ok, Config} = arweave_config:get_env(),
-	ok = ar_kv:open(filename:join(?ROCKS_DB_DIR, "ar_header_sync_db"), ?MODULE),
+	%% Fable C3 follow-up (2026-07-15): dry-run for L2 pre-flight backup
+	%% surfaced this as an unaudited caller. Bug 1 fix on ar_kv:with_db
+	%% turns rocksdb NIF failures into {error, Reason} returns; the old
+	%% `ok = ar_kv:open(...)` pattern-matched only `ok`, so any NIF-level
+	%% open failure (e.g. inconsistent snapshot restore) now badmatched
+	%% and killed the arweave application at boot instead of surfacing
+	%% a meaningful error. Convert to an explicit case with a named
+	%% error so the supervisor's start_error carries a diagnosable
+	%% reason.
+	case ar_kv:open(filename:join(?ROCKS_DB_DIR, "ar_header_sync_db"), ?MODULE) of
+		ok -> ok;
+		{error, OpenReason} ->
+			error({header_sync_db_open_failed, OpenReason})
+	end,
 	{SyncRecord, Height, CurrentBI} =
 		case ar_storage:read_term(header_sync_state) of
 			not_found ->
