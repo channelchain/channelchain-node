@@ -6,7 +6,7 @@
 
 -module(ar_bbs_validator).
 
--export([validate/1]).
+-export([validate/1, validate/2]).
 
 -include_lib("arweave/include/ar.hrl").
 
@@ -76,11 +76,42 @@
 
 %% @doc ChannelChain TX を検証する。
 %% 戻り値: ok | {error, Reason}
-validate(TX) ->
+%%
+%% Type=Bundle (ANS-104 carrier) は ar_bundle_validator に委譲する。
+%% その内部で各 item は pseudo TX 化されて再度 ar_bbs_validator:validate/1
+%% に通るため、ChannelChain 標準の tag / data 制約は各 item に強制される。
+validate(TX) -> validate(TX, []).
+
+%% @doc Variant accepting bundle-related options:
+%%   {bundle_pow_difficulty, N}    carrier PoW difficulty override
+%%   {difficulty, N}               per-item PoW difficulty override
+%%   {skip_bbs_validator, true}    forwarded to ar_bundle_validator
+%% Production callers use validate/1; tests use validate/2 to avoid
+%% mining at the production default (24) and to satisfy the
+%% sub-validator without ETS.
+-spec validate(#tx{}, list()) -> ok | {error, term()}.
+validate(TX, Opts) ->
 	case ar_admin:is_channelchain_tx(TX) of
 		false -> ok;
-		true -> validate_channelchain_tx(TX)
+		true ->
+			case is_bundle_tx(TX) of
+				true  -> validate_bundle_carrier(TX, Opts);
+				false -> validate_channelchain_tx(TX)
+			end
 	end.
+
+is_bundle_tx(TX) ->
+	get_tag(TX, <<"Type">>) =:= <<"Bundle">>.
+
+validate_bundle_carrier(TX, Opts) ->
+	case ar_bundle_validator:validate_bundle(TX, Opts) of
+		{ok, _PseudoTXs} -> ok;
+		{error, Reason}  -> {error, format_bundle_error(Reason)}
+	end.
+
+format_bundle_error(Reason) when is_binary(Reason) -> Reason;
+format_bundle_error(Reason) ->
+	iolist_to_binary(io_lib:format("Bundle rejected: ~p", [Reason])).
 
 validate_channelchain_tx(TX) ->
 	Type = get_tag(TX, <<"Type">>),
