@@ -99,16 +99,33 @@ get_current_difficulty() ->
 		true                               -> ?LOW_LOAD_DIFFICULTY
 	end.
 
-%% @doc Count TXs indexed in the recent time window.
+%% @doc Count TXs indexed inside the DIFFICULTY_WINDOW_SECONDS.
+%%
+%% Fable Alpha-UX (2026-07-24): read the dedicated
+%% `channelchain_recent_tx_window` ETS instead of using the
+%% cumulative channelchain_tx_tags size. That old proxy latched
+%% high forever because ETS size never shrinks, so a single burst
+%% pushed pow_difficulty to NORMAL / MED / HIGH and the chain
+%% never fell back to LOW_LOAD. With the windowed table the
+%% classifier now reflects the actual 10-min TX rate.
+%%
+%% Backward-compat: if the window ETS is absent (e.g. an in-place
+%% upgrade to this code before ar_channelchain_index has re-init'd
+%% its tables), fall back to the old proxy so we do not divide by
+%% zero or crash the mining path.
 count_recent_txs() ->
 	try
-		%% Use the ETS channelchain_tx_tags table size as a proxy
-		%% for recent TX activity. In a production system this would
-		%% track per-window counts, but ETS table size is a reasonable
-		%% approximation for the current single-session dev chain.
-		ets:info(channelchain_tx_tags, size)
+		CutoffMs = erlang:monotonic_time(millisecond) - (?DIFFICULTY_WINDOW_SECONDS * 1000),
+		%% Match spec: entries whose MonotonicMs (>= CutoffMs) count as recent.
+		%% Cheap because the table is small (~10-min sliding window plus
+		%% sweep hysteresis of 20 min at most).
+		Match = [{{'_', '$1'}, [{'>=', '$1', CutoffMs}], [true]}],
+		ets:select_count(channelchain_recent_tx_window, Match)
 	catch
-		_:_ -> 0
+		_:_ ->
+			try ets:info(channelchain_tx_tags, size)
+			catch _:_ -> 0
+			end
 	end.
 
 %% @doc Get difficulty for a specific board.

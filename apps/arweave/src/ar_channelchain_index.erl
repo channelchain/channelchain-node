@@ -33,6 +33,9 @@
 %% e.g. ar_http_iface_client's tombstone trust gate
 -define(SEEN_ITEMS_TABLE, channelchain_seen_items).         %% ItemID → first-seen ts (ms)
 -define(BUNDLE_OF_ITEM_TABLE, channelchain_bundle_of_item). %% ItemID → carrier TXID
+-define(RECENT_TX_TABLE, channelchain_recent_tx_window).    %% TXID → indexed-at monotonic ms; feeds ar_pow_verify:count_recent_txs/0
+-define(RECENT_TX_SWEEP_INTERVAL_MS, 300000).               %% 5 min — hygiene, not correctness
+-define(RECENT_TX_MAX_AGE_MS, 1800000).                     %% 30 min — 3× the ar_pow_verify window; anything older is unambiguously expired
 -define(APP_NAME, <<"ChannelChain">>).
 
 %%%===================================================================
@@ -137,6 +140,17 @@ init([]) ->
         [set, public, named_table, {read_concurrency, true}]),
     ets:new(?BUNDLE_OF_ITEM_TABLE,
         [set, public, named_table, {read_concurrency, true}]),
+    %% Fable Alpha-UX (2026-07-24): time-windowed successor to the
+    %% "ETS table size proxy" that ar_pow_verify:count_recent_txs/0
+    %% used to consult. Storing {TXID, MonotonicMs} lets the PoW
+    %% classifier fall back from HIGH_LOAD to LOW_LOAD naturally
+    %% once a burst ends, instead of latching high forever because
+    %% the cumulative table size never shrinks. Hygiene sweeper
+    %% (handle_info(recent_tx_sweep, ...)) prunes anything past
+    %% RECENT_TX_MAX_AGE_MS so the table cannot grow without bound.
+    ets:new(?RECENT_TX_TABLE,
+        [set, public, named_table, {read_concurrency, true}]),
+    erlang:send_after(?RECENT_TX_SWEEP_INTERVAL_MS, self(), recent_tx_sweep),
     %% Subscribe to tx events (new TX received by node)
     ar_events:subscribe(tx),
     %% Subscribe to block events (TX confirmed in block)
@@ -247,6 +261,21 @@ handle_info({event, node_state, {initialized, _B}}, State) ->
 handle_info({event, node_state, _}, State) ->
     {noreply, State};
 
+%% Fable Alpha-UX (2026-07-24): periodic hygiene sweep for the
+%% recent-tx window ETS. Deletes entries older than
+%% RECENT_TX_MAX_AGE_MS (30 min, 3× the 10-min ar_pow_verify
+%% window) so the table cannot grow without bound in a long-lived
+%% node. Reschedules itself so it survives crashes at the timer
+%% level (each fire schedules the next).
+handle_info(recent_tx_sweep, State) ->
+    Cutoff = erlang:monotonic_time(millisecond) - ?RECENT_TX_MAX_AGE_MS,
+    %% ets:select_delete/2 traversal, atomic per-entry. The '$2' is
+    %% the MonotonicMs; matches entries with ts < Cutoff.
+    Match = [{{'$1', '$2'}, [{'<', '$2', Cutoff}], [true]}],
+    _Dropped = ets:select_delete(?RECENT_TX_TABLE, Match),
+    erlang:send_after(?RECENT_TX_SWEEP_INTERVAL_MS, self(), recent_tx_sweep),
+    {noreply, State};
+
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -333,6 +362,10 @@ index_single_tx(TX, Status) ->
 
     %% Store {txid, tags}
     ets:insert(?TX_TAGS_TABLE, {TXID, Tags}),
+    %% Fable Alpha-UX (2026-07-24): record insertion time for
+    %% ar_pow_verify:count_recent_txs/0's 10-min window. Deleted
+    %% below when the TX is removed (unindex_tx).
+    ets:insert(?RECENT_TX_TABLE, {TXID, erlang:monotonic_time(millisecond)}),
     %% Store full TX record for privileged TXs (needed by ar_admin state rebuild)
     case ar_admin:is_admin_tx(TX) of
         true -> ets:insert(?TX_RECORDS_TABLE, {TXID, TX});
@@ -407,6 +440,7 @@ remove_tx(TXID) ->
             ets:delete(?TX_RECORDS_TABLE, TXID),
             %% Remove tags and inverted index entries
             ets:delete(?TX_TAGS_TABLE, TXID),
+            ets:delete(?RECENT_TX_TABLE, TXID),
             lists:foreach(fun({Name, Value}) ->
                 ets:delete_object(?TX_INDEX_TABLE, {{Name, Value}, TXID})
             end, Tags)
